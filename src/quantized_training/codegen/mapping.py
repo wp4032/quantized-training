@@ -875,7 +875,6 @@ def allocate_activations(model: GraphModule, manager: MemoryManager = None):
 
         # We do not allocate new memory for select operations. Instead, calculate
         # the memory offset from the select index
-        # if node.target == torch.ops.aten.select.int and node.args[1] == 0:
         if (
             node.target == torch.ops.aten.select.int and
             all(d == 1 for d in node.args[0].value.shape[:node.args[1]])
@@ -896,20 +895,25 @@ def allocate_activations(model: GraphModule, manager: MemoryManager = None):
 
         # For stacked layers, place them next to each other so that we can
         # read them using a single memory access in the next operation
-        next_node = next(iter(node.users))
-        if next_node.target in [torch.ops.aten.stack.default, torch.ops.aten.cat.default]:
-            first_node = next_node.args[0][0]
-            tensor_sizes = [n.value.numel() * get_num_bytes(n) for n in next_node.args[0]]
-            if (memory := first_node.meta.get("memory", None)) is None:
-                memory = manager.allocate_memory(first_node, sum(tensor_sizes))
-                first_node.meta["memory"] = memory
+        try:
+            next_node = next(iter(node.users))
+            if next_node.target in [torch.ops.aten.stack.default, torch.ops.aten.cat.default]:
+                first_node = next_node.args[0][0]
+                tensor_sizes = [n.value.numel() * get_num_bytes(n) for n in next_node.args[0]]
+                if (memory := first_node.meta.get("memory", None)) is None:
+                    memory = manager.allocate_memory(first_node, sum(tensor_sizes))
+                    first_node.meta["memory"] = memory
 
-            index = next_node.args[0].index(node)
-            if index > 0:
-                start_offset = memory.start + sum(tensor_sizes[:index])
-                size = tensor_sizes[index]
-                node.meta["memory"] = Partition(start_offset, start_offset + size, manager.partition_id)
-        else:
+                index = next_node.args[0].index(node)
+                if index > 0:
+                    start_offset = memory.start + sum(tensor_sizes[:index])
+                    size = tensor_sizes[index]
+                    node.meta["memory"] = Partition(start_offset, start_offset + size, manager.partition_id)
+            else:
+                node.meta["memory"] = manager.allocate_memory(node)
+        except StopIteration:
+            # If the node has no users, it's a terminal node
+            # Just allocate memory for it normally
             node.meta["memory"] = manager.allocate_memory(node)
 
         nodes_to_delete = delete_unused_values(node)
