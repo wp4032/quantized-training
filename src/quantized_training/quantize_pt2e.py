@@ -8,6 +8,7 @@ from typing import Dict, Tuple, Any, Optional, Callable, List
 import torch
 from torch import Tensor
 from torch._export import capture_pre_autograd_graph
+from torch.export import export_for_training
 from torch.ao.quantization import ObserverOrFakeQuantize
 from torch.ao.quantization.fx.utils import assert_and_get_unique_device
 from torch.ao.quantization.quantizer import (
@@ -39,6 +40,8 @@ from .codegen.mapping_utils import (
     _is_reshape_op,
 )
 from .decomposed import quantized_decomposed_lib
+import logging
+logger = logging.getLogger(__name__)
 
 
 def _create_obs_or_fq_from_qspec(quantization_spec, obs_or_fq_map, is_qat):
@@ -233,22 +236,90 @@ def get_default_quantizer(
         .set_object_type(torch.ops.aten.matmul.default, qconfig_matmul)
 
 
-def prepare_pt2e(model, quantizer, args, kwargs=None, dynamic_shapes=None):
-    from torch.ao.quantization.pt2e import prepare
+def prepare_pt2e_compiler(model, quantizer, example_args=None, dynamic_shapes=None):
+    """
+    Prepare a model for quantization using PT2E (PyTorch 2.0 Export).
+    """
     from torch.ao.quantization.quantize_pt2e import prepare_pt2e
+    # Create dynamic shape constraints if provided
+    if dynamic_shapes is not None:
+        constraints = []
+        for arg_name, shape in dynamic_shapes.items():
+            for dim_idx, dim in shape.items():
+                constraints.append(
+                    torch.export.DynamicDim(f"{arg_name}_{dim_idx}", min=dim.min, max=dim.max)
+                )
+    else:
+        constraints = None
 
-    # HACK replace the default implementation of _create_obs_or_fq_from_qspec
-    prepare._get_obs_or_fq_map = _get_obs_or_fq_map
-
-    model = capture_pre_autograd_graph(
-        model,
-        args=args,
-        kwargs=kwargs,
-        dynamic_shapes=dynamic_shapes,
-    )
-
-    model = prepare_pt2e(model, quantizer)
-    return model
+    try:
+        # First try to export the model for training
+        exported_program = export_for_training(model, example_args, dynamic_shapes=constraints)
+        
+        # Get the graph module from the exported program
+        graph_module = exported_program.graph_module
+        
+        # Create a wrapper class that preserves the original model's parameters
+        class WrappedGraphModule(torch.nn.Module):
+            def __init__(self, graph_module, original_model):
+                super().__init__()
+                self.graph_module = graph_module
+                # Copy all parameters from the original model
+                for name, param in original_model.named_parameters():
+                    # Replace dots with underscores in parameter names
+                    safe_name = name.replace('.', '_')
+                    # Register the parameter with the safe name
+                    self.register_parameter(safe_name, param)
+                
+            def forward(self, *args, **kwargs):
+                # Get all parameters from the wrapper
+                param_dict = {}
+                for name, param in self.named_parameters():
+                    # Map the safe name back to the original name for the graph module
+                    orig_name = name.replace('_', '.')
+                    param_dict[orig_name] = param
+                
+                # Pass all parameters as keyword arguments to the graph module
+                return self.graph_module(*args, **{**kwargs, **param_dict})
+        
+        wrapped_model = WrappedGraphModule(graph_module, model)
+        
+        # Copy any metadata from the original model if it exists
+        if hasattr(model, 'meta'):
+            wrapped_model.meta = model.meta
+            
+        # Prepare the wrapped model for quantization
+        prepared_model = prepare_pt2e(wrapped_model, quantizer)
+        
+        return prepared_model
+        
+    except Exception as e:
+        # If export fails, fall back to capture_pre_autograd_graph
+        logger.warning(f"Export for training failed: {e}. Falling back to capture_pre_autograd_graph.")
+        
+        if example_args is None:
+            raise ValueError("example_args must be provided when falling back to capture_pre_autograd_graph")
+            
+        # Create a wrapper class to handle the forward pass
+        class WrappedGraphModule(torch.nn.Module):
+            def __init__(self, original_model):
+                super().__init__()
+                self.original_model = original_model
+                
+            def forward(self, *args, **kwargs):
+                return self.original_model(*args, **kwargs)
+        
+        wrapped_model = WrappedGraphModule(model)
+        graph_module = capture_pre_autograd_graph(wrapped_model, example_args)
+        
+        # Copy any metadata from the original model if it exists
+        if hasattr(model, 'meta'):
+            graph_module.meta = model.meta
+            
+        # Prepare the graph module for quantization
+        prepared_model = prepare_pt2e(graph_module, quantizer)
+        
+        return prepared_model
 
 
 def _get_module(node: Node, named_modules: Dict[str, torch.nn.Module]) -> Optional[torch.nn.Module]:

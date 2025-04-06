@@ -23,7 +23,7 @@ from quantized_training import (
     add_qspec_args,
     convert_pt2e,
     get_default_quantizer,
-    prepare_pt2e,
+    prepare_pt2e_compiler,
     transform,
     compile,
     derive_bias_qparams_fn
@@ -186,7 +186,7 @@ if __name__ == "__main__":
             quantizer.set_module_name("conv1", qconfig)
 
         example_args = (torch.randn(1, 3, 224, 224, dtype=torch_dtype),)
-        gm = prepare_pt2e(model, quantizer, example_args)
+        gm = prepare_pt2e_compiler(model, quantizer, example_args)
 
         dataset = load_dataset("zh-plus/tiny-imagenet")
 
@@ -228,7 +228,7 @@ if __name__ == "__main__":
 
         inputs = preprocess(dataset['train'][0]["image"])
         example_args = (inputs.unsqueeze(0).to(torch_dtype),)
-        gm = prepare_pt2e(model, quantizer, example_args)
+        gm = prepare_pt2e_compiler(model, quantizer, example_args)
 
         for i in tqdm(range(10)):
             inputs = preprocess(dataset['train'][i]["image"])
@@ -303,7 +303,7 @@ if __name__ == "__main__":
 
         quantizer.set_module_name("classifier", None)
 
-        gm = prepare_pt2e(MobileBertNoEmbed(), quantizer, example_args)
+        gm = prepare_pt2e_compiler(MobileBertNoEmbed(), quantizer, example_args)
 
         for step, batch in enumerate(tqdm(train_dataloader)):
             embedding_output = model.mobilebert.embeddings(
@@ -323,29 +323,43 @@ if __name__ == "__main__":
         orig_output, new_output = transform(gm, example_args, patterns=vector_stages)
         compile(gm, example_args, **compile_args)
     elif args.model == "mobilebert_encoder":
+        def print_header(header):
+            text = f"== {header} =="
+            print("\n" + "=" * len(text))
+            print(text)
+            print("=" * len(text) + "\n")
+
         if args.model_name_or_path is None:
             args.model_name_or_path = "google/mobilebert-uncased"
         model = AutoModelForSequenceClassification.from_pretrained(args.model_name_or_path).eval()
+
 
         if args.bf16:
             model.bfloat16()
 
         example_args = (
-            torch.randn(1, 128, 512, dtype=torch_dtype),
-            torch.ones(1, 128, 128, dtype=torch_dtype),
-            None,
+            torch.randn(1, 128, 512, dtype=torch_dtype),    # hidden states tensor
+            torch.ones(1, 128, 128, dtype=torch_dtype),     # attention mask tensor
+            None,                                           # head mask tensor   
         )
+        # from torch.export import export_for_training
+        # gm = export_for_training(model.mobilebert.encoder.layer[0], args=example_args)
+        # print(gm.graph.print_tabular())
 
         class MobileBertEncoder(torch.nn.Module):
-            def __init__(self):
+            def __init__(self, model):
                 super().__init__()
+                self.encoder_layer_0 = model.mobilebert.encoder.layer[0]
 
             def forward(self, *args, **kwargs):
-                output = model.mobilebert.encoder.layer[0](*args, **kwargs)
+                output = self.encoder_layer_0(*args, **kwargs)
                 return output[0][0]
 
-        gm = prepare_pt2e(MobileBertEncoder(), quantizer, example_args)
+        # Insert observers / fake quantization modules
+        print_header("MobileBertEncoder: Preparing Quantization")
+        gm = prepare_pt2e_compiler(MobileBertEncoder(model), quantizer, example_args)
 
+        # Fake quantize needs mulitple passes for calibration
         for i in range(3):
             gm(*example_args)
 
@@ -353,9 +367,13 @@ if __name__ == "__main__":
             if hasattr(module, "scale"):
                 print(module.scale)
 
+        print_header("MobileBertEncoder: Converting to PT2E")
         convert_pt2e(gm, args.bias)
 
+        print_header("MobileBertEncoder: Transforming")
         orig_output, new_output = transform(gm, example_args, patterns=vector_stages)
+
+        print_header("MobileBertEncoder: Compiling")
         compile(gm, example_args, **compile_args)
 
         orig_output = orig_output[0]
@@ -410,7 +428,7 @@ if __name__ == "__main__":
 
         quantizer.set_module_name("classifier", None)
 
-        gm = prepare_pt2e(BertNoEmbed(), quantizer, example_args)
+        gm = prepare_pt2e_compiler(BertNoEmbed(), quantizer, example_args)
         convert_pt2e(gm, args.bias)
 
         orig_output, new_output = transform(gm, example_args, patterns=vector_stages)
@@ -504,7 +522,7 @@ if __name__ == "__main__":
                 logits = self.lm_head(hidden_states)
                 return logits
 
-        gm = prepare_pt2e(model, quantizer, example_args, example_kwargs)
+        gm = prepare_pt2e_compiler(model, quantizer, example_args, example_kwargs)
 
         hidden_size = model.model.layers[0].input_layernorm.weight.shape[-1]
         example_input = torch.randn(1, 128, hidden_size, dtype=torch.bfloat16)
@@ -564,7 +582,7 @@ if __name__ == "__main__":
         example_args = (inputs_embeds, causal_mask, position_embeddings)
         model = LLamaDecoder()
 
-        gm = prepare_pt2e(model, quantizer, example_args)
+        gm = prepare_pt2e_compiler(model, quantizer, example_args)
 
         # Calibrate using random inputs
         for i in range(3):
@@ -611,7 +629,7 @@ if __name__ == "__main__":
 
         inputs = image_processor(dataset['train'][0]["image"], return_tensors="pt")
         example_args = (inputs.pixel_values.to(torch_dtype),)
-        gm = prepare_pt2e(model, quantizer, example_args)
+        gm = prepare_pt2e_compiler(model, quantizer, example_args)
 
         for i in tqdm(range(10)):
             inputs = image_processor(dataset['train'][i]["image"], return_tensors="pt")
@@ -638,7 +656,7 @@ if __name__ == "__main__":
         example_args = (torch.randn(1, 3, 640, 640, dtype=torch_dtype),)
         output = model(*example_args)
 
-        gm = prepare_pt2e(model, quantizer, example_args)
+        gm = prepare_pt2e_compiler(model, quantizer, example_args)
 
         from quantized_training.codegen.mapping import eliminate_dead_code
         eliminate_dead_code(gm.graph)
@@ -673,7 +691,7 @@ if __name__ == "__main__":
         model = timm.create_model("hf-hub:timm/mobilevit_xxs.cvnets_in1k", pretrained=True).eval()
 
         example_args = (torch.randn(1, 3, 224, 224, dtype=torch_dtype),)
-        gm = prepare_pt2e(model, quantizer, example_args)
+        gm = prepare_pt2e_compiler(model, quantizer, example_args)
 
         dataset = load_dataset("zh-plus/tiny-imagenet")
 

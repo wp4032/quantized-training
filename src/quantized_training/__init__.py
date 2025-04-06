@@ -36,7 +36,7 @@ __all__ = [
     "plot_histogram",
     "plot_layer_range",
     "prepare",
-    "prepare_pt2e",
+    "prepare_pt2e_compiler",
     "print_node_scope_tabular",
     "propagate_config",
     "quantize",
