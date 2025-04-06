@@ -110,6 +110,10 @@ if __name__ == "__main__":
     add_qspec_args(parser)
     args = parser.parse_args()
 
+    if args.model == "mobilebert" or args.model == "mobilebert_encoder":
+        if args.context_length > 512:
+            raise ValueError(f"{args.model} only supports context length <= 512")
+
     quantizer = get_default_quantizer(
         input_activation=args.activation,
         output_activation=args.output_activation,
@@ -263,7 +267,8 @@ if __name__ == "__main__":
             texts = (
                 (examples[sentence1_key],) if sentence2_key is None else (examples[sentence1_key], examples[sentence2_key])
             )
-            result = tokenizer(*texts, padding="max_length", max_length=128, truncation=True)
+            # Use args.context_length instead of hardcoded 128
+            result = tokenizer(*texts, padding="max_length", max_length=args.context_length, truncation=True)
             result["labels"] = examples["label"]
             return result
 
@@ -330,9 +335,10 @@ if __name__ == "__main__":
         if args.bf16:
             model.bfloat16()
 
+        # Added context length
         example_args = (
-            torch.randn(1, 128, 512, dtype=torch_dtype),
-            torch.ones(1, 128, 128, dtype=torch_dtype),
+            torch.randn(1, args.context_length, 512, dtype=torch_dtype),
+            torch.ones(1, args.context_length, args.context_length, dtype=torch_dtype),
             None,
         )
 
