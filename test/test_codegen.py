@@ -26,7 +26,8 @@ from quantized_training import (
     prepare_pt2e_compiler,
     transform,
     compile,
-    derive_bias_qparams_fn
+    derive_bias_qparams_fn,
+    rename_graph_nodes,
 )
 from quantized_training.codegen.utils import (
     get_conv_bn_layers,
@@ -322,6 +323,80 @@ if __name__ == "__main__":
 
         orig_output, new_output = transform(gm, example_args, patterns=vector_stages)
         compile(gm, example_args, **compile_args)
+    elif args.model == "mobilebert_attention":
+        def print_header(header):
+            text = f"== {header} =="
+            print("\n" + "=" * len(text))
+            print(text)
+            print("=" * len(text) + "\n")
+
+        if args.model_name_or_path is None:
+            args.model_name_or_path = "google/mobilebert-uncased"
+        model = AutoModelForSequenceClassification.from_pretrained(args.model_name_or_path).eval()
+        
+        if args.bf16:
+            model.bfloat16()
+
+        # example_args = (
+        #     torch.randn(1, 128, 512, dtype=torch_dtype),    # query_tensor
+        #     torch.randn(1, 128, 512, dtype=torch_dtype),    # key_tensor
+        #     torch.randn(1, 128, 512, dtype=torch_dtype),    # value_tensor
+        #     torch.ones(1, 128, 128, dtype=torch_dtype),     # attention_mask
+        #     None,                                           # head_mask
+        #     False                                           # output_attentions
+        # )
+
+        example_args = (
+            torch.randn(1, 128, 512, dtype=torch_dtype),    # hidden_states
+            torch.ones(1, 128, 128, dtype=torch_dtype),     # attention_mask
+            None,                                           # head_mask
+        )
+
+        class MobileBertSelfAttention(torch.nn.Module):
+            def __init__(self, model):
+                super().__init__()
+                self.layer = model.mobilebert.encoder.layer[0]
+                self.attention = self.layer.attention.self
+
+            def forward(self, hidden_states, attention_mask=None, head_mask=None):
+                # Get the transformed tensors from the bottleneck
+                query_tensor, key_tensor, value_tensor, layer_input = self.layer.bottleneck(hidden_states)
+                
+                # Pass to attention layer with all required arguments
+                output = self.attention(
+                    query_tensor,
+                    key_tensor,
+                    value_tensor,
+                    layer_input,  # Add the layer_input parameter
+                    attention_mask,
+                    head_mask,
+                )
+                return output
+
+        # Insert observers / fake quantization modules
+        print_header("MobileBertEncoder: Preparing Quantization")
+        gm = prepare_pt2e_compiler(MobileBertSelfAttention(model), quantizer, example_args)
+
+        rename_graph_nodes(gm.graph)
+        # Fake quantize needs mulitple passes for calibration
+        for i in range(3):
+            gm(*example_args)
+
+        for name, module in gm.named_modules():
+            if hasattr(module, "scale"):
+                print(module.scale)
+
+        print_header("MobileBertEncoder: Converting to PT2E")
+        convert_pt2e(gm, args.bias)
+
+        print_header("MobileBertEncoder: Transforming")
+        orig_output, new_output = transform(gm, example_args, patterns=vector_stages)
+
+        print_header("MobileBertEncoder: Compiling")
+        compile(gm, example_args, **compile_args)
+
+        orig_output = orig_output[0]
+        new_output = new_output[0]
     elif args.model == "mobilebert_encoder":
         def print_header(header):
             text = f"== {header} =="
@@ -333,7 +408,6 @@ if __name__ == "__main__":
             args.model_name_or_path = "google/mobilebert-uncased"
         model = AutoModelForSequenceClassification.from_pretrained(args.model_name_or_path).eval()
 
-
         if args.bf16:
             model.bfloat16()
 
@@ -342,9 +416,6 @@ if __name__ == "__main__":
             torch.ones(1, 128, 128, dtype=torch_dtype),     # attention mask tensor
             None,                                           # head mask tensor   
         )
-        # from torch.export import export_for_training
-        # gm = export_for_training(model.mobilebert.encoder.layer[0], args=example_args)
-        # print(gm.graph.print_tabular())
 
         class MobileBertEncoder(torch.nn.Module):
             def __init__(self, model):

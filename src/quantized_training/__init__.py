@@ -13,6 +13,7 @@ from .training_args import *
 from .utils import *
 from .histogram import *
 from .quantize_pt2e import fuse_quantize_dequantize_with_previous_op
+from .ee372_flash_attention import rename_graph_nodes
 from google.protobuf import text_format
 import operator
 
@@ -46,6 +47,7 @@ __all__ = [
     "quantize_to_posit",
     "replace_softmax",
     "setup_logging",
+    "rename_graph_nodes",
 ]
 
 class qscheme: ...
@@ -110,7 +112,7 @@ def transform(
         ]
 
         ShapeProp(model).propagate(*flatten_args)
-        fuse_operator(model, vector_stages)
+        # fuse_operator(model, vector_stages)
 
     model.graph.print_tabular()
 
