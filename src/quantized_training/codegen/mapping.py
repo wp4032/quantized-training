@@ -896,20 +896,24 @@ def allocate_activations(model: GraphModule, manager: MemoryManager = None):
 
         # For stacked layers, place them next to each other so that we can
         # read them using a single memory access in the next operation
-        next_node = next(iter(node.users))
-        if next_node.target in [torch.ops.aten.stack.default, torch.ops.aten.cat.default]:
-            first_node = next_node.args[0][0]
-            tensor_sizes = [n.value.numel() * get_num_bytes(n) for n in next_node.args[0]]
-            if (memory := first_node.meta.get("memory", None)) is None:
-                memory = manager.allocate_memory(first_node, sum(tensor_sizes))
-                first_node.meta["memory"] = memory
+        if node.users:
+            next_node = next(iter(node.users))
+            if next_node.target in [torch.ops.aten.stack.default, torch.ops.aten.cat.default]:
+                first_node = next_node.args[0][0]
+                tensor_sizes = [n.value.numel() * get_num_bytes(n) for n in next_node.args[0]]
+                if (memory := first_node.meta.get("memory", None)) is None:
+                    memory = manager.allocate_memory(first_node, sum(tensor_sizes))
+                    first_node.meta["memory"] = memory
 
-            index = next_node.args[0].index(node)
-            if index > 0:
-                start_offset = memory.start + sum(tensor_sizes[:index])
-                size = tensor_sizes[index]
-                node.meta["memory"] = Partition(start_offset, start_offset + size, manager.partition_id)
+                index = next_node.args[0].index(node)
+                if index > 0:
+                    start_offset = memory.start + sum(tensor_sizes[:index])
+                    size = tensor_sizes[index]
+                    node.meta["memory"] = Partition(start_offset, start_offset + size, manager.partition_id)
+            else:
+                node.meta["memory"] = manager.allocate_memory(node)
         else:
+            # Handle nodes with no users (like output nodes)
             node.meta["memory"] = manager.allocate_memory(node)
 
         nodes_to_delete = delete_unused_values(node)
@@ -920,62 +924,95 @@ def allocate_activations(model: GraphModule, manager: MemoryManager = None):
         manager.take_snapshot()
 
 
-def gen_code(model, args, output_dir=None):
+def gen_code(model, args, output_dir=None, max_fused_ops=None):
     if output_dir is not None:
         os.makedirs(output_dir, exist_ok=True)
 
     named_modules = dict(model.named_modules(remove_duplicate=False))
-
-    ShapeProp(model).propagate(*args)
     model_params = Model()
+    
+    def process_module(gm, module_args=None):
+        current_args = module_args if module_args is not None else args
+        
+        for node in gm.graph.nodes:
+            node_value = getattr(node, 'value', None)
+            if not isinstance(node_value, (torch.Tensor, tuple, list)):
+                continue
 
-    for node in model.graph.nodes:
-        node_value = getattr(node, 'value', None)
-        if not isinstance(node_value, (torch.Tensor, tuple, list)):
-            continue
-
-        op = Operation()
-
-        if node.op == 'placeholder':
-            tensor = Tensor()
-            set_tensor_field(tensor, node, output_dir, True)
-            model_params.inputs.append(tensor)
-            continue
-        elif node.op == 'get_attr' and "memory" in node.meta:
-            tensor = Tensor()
-            set_tensor_field(tensor, node, output_dir, True)
-            model_params.parameters.append(tensor)
-            continue
-        elif node.op == 'call_function':
-            op.op.CopyFrom(map_node(node, output_dir))
-        elif node.op == 'call_module':
-            gm = named_modules[node.target]
-            assert isinstance(gm, torch.fx.GraphModule)
-            submodule_args = torch.fx.node.map_arg(node.args, lambda n: n.value.clone())
-            ShapeProp(gm).propagate(*submodule_args)
-
-            operators = []
-            for n in gm.graph.nodes:
-                if n.op != 'call_function' or n.meta.get('fused', False) or _is_nop(n):
-                    continue
-                operators.append(map_node(n, output_dir))
-
-            op.fused_op.name = node.name
-            op.fused_op.op_list.extend(operators)
-        else:
-            continue
-
-        set_output_field(op, node, output_dir)
-
-        model_params.ops.append(op)
-
+            op = Operation()
+            
+            if node.op == 'placeholder':
+                tensor = Tensor()
+                set_tensor_field(tensor, node, output_dir, True)
+                model_params.inputs.append(tensor)
+                continue
+            elif node.op == 'get_attr' and "memory" in node.meta:
+                tensor = Tensor()
+                set_tensor_field(tensor, node, output_dir, True)
+                model_params.parameters.append(tensor)
+                continue
+            elif node.op == 'call_function':
+                op.op.CopyFrom(map_node(node, output_dir))
+                if "memory" in node.meta:  # Check if memory is allocated
+                    set_output_field(op, node, output_dir)
+                model_params.ops.append(op)
+            elif node.op == 'call_module':
+                submodule = named_modules[node.target]
+                if isinstance(submodule, torch.fx.GraphModule):
+                    submodule_args = torch.fx.node.map_arg(node.args, lambda n: n.value.clone())
+                    
+                    if should_fuse_module(submodule, max_fused_ops):
+                        fused_op = Operation()
+                        operators = []
+                        
+                        for n in submodule.graph.nodes:
+                            if n.op != 'call_function' or n.meta.get('fused', False) or _is_nop(n):
+                                continue
+                            operators.append(map_node(n, output_dir))
+                        
+                        fused_op.fused_op.name = node.name
+                        fused_op.fused_op.op_list.extend(operators)
+                        if "memory" in node.meta:  # Check if memory is allocated
+                            set_output_field(fused_op, node, output_dir)
+                        model_params.ops.append(fused_op)
+                    else:
+                        process_module(submodule, submodule_args)
+    
+    process_module(model)
     return model_params
+
+
+def should_fuse_module(module, max_fused_ops=None):
+    """
+    Determine whether a module should be fused based on various criteria.
+    """
+    if max_fused_ops is None:
+        return True  # Default to current behavior
+        
+    # Count operations that would be fused
+    op_count = sum(1 for node in module.graph.nodes 
+                  if node.op == 'call_function' and not node.meta.get('fused', False))
+    
+    # Don't fuse if too many operations
+    if op_count > max_fused_ops:
+        return False
+        
+    # Add additional criteria here as needed
+    # For example:
+    # - Memory usage
+    # - Operation types
+    # - Data dependencies
+    # - etc.
+    
+    return True
 
 
 def gen_compute_graph(model, output_file="compute_graph", max_users=10):
     nodes = {}
     edges = []
     named_modules = dict(model.named_modules(remove_duplicate=False))
+    
+    # First pass: collect all nodes including submodule operations
     for node in model.graph.nodes:
         if node.op == "get_attr" or not hasattr(node, "value"):
             continue
@@ -999,14 +1036,47 @@ def gen_compute_graph(model, output_file="compute_graph", max_users=10):
         else:
             continue
 
-        body = None
+        # Handle submodules by expanding their operations
         if node.op == "call_module":
             gm = named_modules[node.target]
             if isinstance(gm, torch.fx.GraphModule):
-                body = "&#92;n".join([
-                    n.name for n in gm.graph.nodes if n.op == "call_function"
-                ])
-        label = f"{{{header}}}" if body is None else f"{{{header}|{body}}}"
+                # Add nodes for each operation in the submodule
+                prev_node = None
+                for subnode in gm.graph.nodes:
+                    if subnode.op == "call_function":
+                        subnode_name = f"{node.name}_{subnode.name}"
+                        subnode_header = subnode.name
+                        if hasattr(subnode, "value") and isinstance(subnode.value, torch.Tensor):
+                            subnode_header += f"&#92;n{str(tuple(subnode.value.shape))}"
+                            if (dtype := subnode.meta.get("dtype", None)) is not None:
+                                subnode_header += f"&#92;n{dtype}"
+                        
+                        subnode_label = f"{{{subnode_header}}}"
+                        subnode_label = subnode_label.replace("<", "\<").replace(">", "\>")
+                        
+                        nodes[subnode_name] = {
+                            "label": subnode_label,
+                            "shape": "Mrecord",
+                        }
+                        
+                        # Connect submodule operations in sequence
+                        if prev_node:
+                            edges.append((prev_node, subnode_name))
+                        prev_node = subnode_name
+                        
+                        # Connect input edges from parent module's inputs
+                        for arg in subnode.args:
+                            if isinstance(arg, torch.fx.Node) and arg.op == "placeholder":
+                                edges.append((node.name, subnode_name))
+                
+                # Connect the last submodule operation to the parent module's output
+                if prev_node:
+                    for user in node.users:
+                        edges.append((prev_node, user.name))
+                continue
+
+        # For non-submodule nodes
+        label = f"{{{header}}}"
         label = label.replace("<", "\<").replace(">", "\>")
 
         nodes[node.name] = {
@@ -1014,6 +1084,7 @@ def gen_compute_graph(model, output_file="compute_graph", max_users=10):
             "shape": "Mrecord",
         }
 
+        # Handle edges for non-submodule nodes
         users = list(node.users)
         num_users = len(users)
         if num_users > max_users:
@@ -1023,7 +1094,6 @@ def gen_compute_graph(model, output_file="compute_graph", max_users=10):
                 sub_label = f"{{{sub_node}}}"
                 sub_label = sub_label.replace("<", "\<").replace(">", "\>")
 
-                # Create a sub-node for this group of users
                 nodes[sub_node] = {
                     "label": sub_label,
                     "shape": "Mrecord",
@@ -1031,7 +1101,6 @@ def gen_compute_graph(model, output_file="compute_graph", max_users=10):
 
                 edges.append((node.name, sub_node))
 
-                # Add edges from sub-node to its users
                 start_idx = i * max_users
                 end_idx = min(start_idx + max_users, num_users)
                 for u in users[start_idx:end_idx]:
