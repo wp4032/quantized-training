@@ -187,9 +187,24 @@ def _decompose_bmm_mx(model: GraphModule, node: Node):
 
 
 def split_multi_head_attention(model: GraphModule):
+    """
+    Split multi-head attention operations into separate matrix multiplications.
+    
+    This function identifies matrix multiplication operations that are part of 
+    multi-head attention mechanisms and decomposes them for better optimization.
+    
+    Args:
+        model: The GraphModule containing the operations to transform
+        
+    Returns:
+        The transformed GraphModule
+    """
     graph = model.graph
+    graph.print_tabular()
+    # Find all matrix multiplication operations in the graph
     partitions = get_source_partitions(graph, [torch.matmul])
     partitions = list(itertools.chain.from_iterable(partitions.values()))
+    # Group matrix multiplications by their parent module
     grouped_nodes = defaultdict(list)
     for partition in partitions:
         matmul_node = partition.output_nodes[0]
@@ -200,6 +215,7 @@ def split_multi_head_attention(model: GraphModule):
         grouped_nodes[bt[0]].append(matmul_node)
 
     for nodes in grouped_nodes.values():
+        # If we don't have exactly 2 matmuls (query-key and attention-value), decompose them individually
         if len(nodes) != 2:
             for node in nodes:
                 if node.target == torch.ops.aten.matmul.default:
@@ -208,8 +224,14 @@ def split_multi_head_attention(model: GraphModule):
                     _decompose_bmm_mx(model, node)
             continue
 
+        # Extract the query-key and attention-value matmul nodes
         qk_matmul, av_matmul = nodes[0], nodes[1]
+        
+        # Store original names to preserve them
+        qk_matmul_name = qk_matmul.name
+        av_matmul_name = av_matmul.name
 
+        # Extract the tensors and scales involved in the attention mechanism
         query = qk_matmul.args[0]
         key = qk_matmul.args[1]
         value = av_matmul.args[1]
@@ -217,7 +239,7 @@ def split_multi_head_attention(model: GraphModule):
         key_scale = qk_matmul.kwargs.get('weight_scale', None)
         value_scale = av_matmul.kwargs.get('weight_scale', None)
 
-        # Find the nodes between the qk and av matmuls
+        # Find the nodes between the query-key and attention-value matmuls using DFS
         def dfs(current_node, visited):
             if current_node == av_matmul:
                 return [visited]
@@ -229,15 +251,16 @@ def split_multi_head_attention(model: GraphModule):
 
         paths = dfs(qk_matmul, [qk_matmul])
 
+        # Collect all nodes that are between the two matmuls
         nodes_between = set()
         for path in paths:
             nodes_between.update(path[1:-1])
 
-        # Sort the nodes between the qk and av matmuls
+        # Sort the nodes between the matmuls in topological order
         order = {node: idx for idx, node in enumerate(graph.nodes)}
         nodes_between = sorted(nodes_between, key=lambda n: order[n])
 
-        # Decompose BMM into multiple matmuls
+        # Decompose the batch matrix multiplications based on their type
         if qk_matmul.target == torch.ops.aten.matmul.default:
             qk_output = _decompose_bmm(model, qk_matmul)
             av_output = _decompose_bmm(model, av_matmul)
@@ -245,7 +268,7 @@ def split_multi_head_attention(model: GraphModule):
             qk_output = _decompose_bmm_mx(model, qk_matmul)
             av_output = _decompose_bmm_mx(model, av_matmul)
 
-        # Annotate the dtype of the new nodes in the graph
+        # Helper function to propagate dtype metadata to select operations
         def propagate_input_dtype(node):
             if (dtype := node.meta.get('dtype', None)) is None:
                 return
@@ -254,6 +277,7 @@ def split_multi_head_attention(model: GraphModule):
                     user.meta['dtype'] = dtype
                     propagate_input_dtype(user)
 
+        # Helper function to propagate dtype metadata to output nodes
         def propagate_output_dtype(orig_node, new_node):
             if (dtype := orig_node.meta.get('dtype', None)) is None:
                 return
@@ -261,6 +285,7 @@ def split_multi_head_attention(model: GraphModule):
             for node in output_nodes:
                 node.meta['dtype'] = dtype
 
+        # Propagate dtype information to maintain correctness
         if qk_output is not None:
             propagate_input_dtype(query)
             propagate_input_dtype(key)
@@ -279,38 +304,60 @@ def split_multi_head_attention(model: GraphModule):
         if value_scale is not None:
             propagate_input_dtype(value_scale)
 
+        # Skip if decomposition failed for either matmul
         if qk_output is None or av_output is None:
             continue
 
-        # Duplicate the nodes between the qk and av matmuls to perform fusion
+        # Extract the individual matmul operations from the decomposed nodes
         qk_matmuls = qk_output.args[0].args[0]
         av_matmuls = av_output.args[0].args[0]
+        
+        # Restore original names to the first matmul in each sequence
+        qk_matmuls[0].name = qk_matmul_name
+        av_matmuls[0].name = av_matmul_name
 
+        # Connect the first matmul in the sequence
         nodes_between[0].replace_input_with(qk_output, qk_matmuls[0])
         av_matmuls[0].replace_input_with(av_matmuls[0].args[0], nodes_between[-1])
 
+        # Handle scale nodes if present
         if (scale_node := av_matmuls[0].kwargs.get('input_scale', None)) is not None:
             av_matmuls[0].replace_input_with(scale_node, nodes_between[-2])
 
-        for qk_matmul, av_matmul in zip(qk_matmuls[1:], av_matmuls[1:]):
+        # For each pair of matmuls after the first, duplicate the intermediate nodes
+        for i, (qk_matmul, av_matmul) in enumerate(zip(qk_matmuls[1:], av_matmuls[1:]), 1):
+            # Set names for the additional matmuls
+            qk_matmul.name = f"{qk_matmul_name}_{i}"
+            av_matmul.name = f"{av_matmul_name}_{i}"
+            
             value_remap = {qk_matmuls[0]: qk_matmul}
             for node in nodes_between:
+                # Create a copy of the intermediate node before the attention-value matmul
                 with graph.inserting_before(av_matmul):
-                    value_remap[node] = graph.node_copy(node, lambda n: value_remap.get(n, n))
+                    # Append suffix _i to the duplicated node name
+                    new_name = f"{node.name}_{i}"
+                    copied_node = graph.node_copy(node, lambda n: value_remap.get(n, n))
+                    copied_node.name = new_name
+                    value_remap[node] = copied_node
 
+                # Preserve source function stack information for debugging
                 if (source_fn_st := node.meta.get('source_fn_stack', None)) is not None:
                     source_fn = source_fn_st[-1]
                     value_remap[node].meta['source_fn_stack'] = [
                         (value_remap[node].name, source_fn[1])
                     ]
 
+            # Connect the duplicated nodes to the corresponding attention-value matmul
             av_matmul.replace_input_with(av_matmul.args[0], value_remap[nodes_between[-1]])
 
+            # Handle scale nodes for the duplicated path
             if (scale_node := av_matmul.kwargs.get('input_scale', None)) is not None:
                 av_matmul.replace_input_with(scale_node, value_remap[nodes_between[-2]])
 
+    # Verify the graph is valid
     graph.lint()
 
+    # Clean up any nodes that are no longer used
     graph.eliminate_dead_code()
     model.recompile()
 
@@ -875,7 +922,6 @@ def allocate_activations(model: GraphModule, manager: MemoryManager = None):
 
         # We do not allocate new memory for select operations. Instead, calculate
         # the memory offset from the select index
-        # if node.target == torch.ops.aten.select.int and node.args[1] == 0:
         if (
             node.target == torch.ops.aten.select.int and
             all(d == 1 for d in node.args[0].value.shape[:node.args[1]])
@@ -896,20 +942,24 @@ def allocate_activations(model: GraphModule, manager: MemoryManager = None):
 
         # For stacked layers, place them next to each other so that we can
         # read them using a single memory access in the next operation
-        next_node = next(iter(node.users))
-        if next_node.target in [torch.ops.aten.stack.default, torch.ops.aten.cat.default]:
-            first_node = next_node.args[0][0]
-            tensor_sizes = [n.value.numel() * get_num_bytes(n) for n in next_node.args[0]]
-            if (memory := first_node.meta.get("memory", None)) is None:
-                memory = manager.allocate_memory(first_node, sum(tensor_sizes))
-                first_node.meta["memory"] = memory
+        if node.users:
+            next_node = next(iter(node.users))
+            if next_node.target in [torch.ops.aten.stack.default, torch.ops.aten.cat.default]:
+                first_node = next_node.args[0][0]
+                tensor_sizes = [n.value.numel() * get_num_bytes(n) for n in next_node.args[0]]
+                if (memory := first_node.meta.get("memory", None)) is None:
+                    memory = manager.allocate_memory(first_node, sum(tensor_sizes))
+                    first_node.meta["memory"] = memory
 
-            index = next_node.args[0].index(node)
-            if index > 0:
-                start_offset = memory.start + sum(tensor_sizes[:index])
-                size = tensor_sizes[index]
-                node.meta["memory"] = Partition(start_offset, start_offset + size, manager.partition_id)
+                index = next_node.args[0].index(node)
+                if index > 0:
+                    start_offset = memory.start + sum(tensor_sizes[:index])
+                    size = tensor_sizes[index]
+                    node.meta["memory"] = Partition(start_offset, start_offset + size, manager.partition_id)
+            else:
+                node.meta["memory"] = manager.allocate_memory(node)
         else:
+            # Handle nodes with no users (like output nodes)
             node.meta["memory"] = manager.allocate_memory(node)
 
         nodes_to_delete = delete_unused_values(node)
@@ -920,62 +970,95 @@ def allocate_activations(model: GraphModule, manager: MemoryManager = None):
         manager.take_snapshot()
 
 
-def gen_code(model, args, output_dir=None):
+def gen_code(model, args, output_dir=None, max_fused_ops=None):
     if output_dir is not None:
         os.makedirs(output_dir, exist_ok=True)
 
     named_modules = dict(model.named_modules(remove_duplicate=False))
-
-    ShapeProp(model).propagate(*args)
     model_params = Model()
+    
+    def process_module(gm, module_args=None):
+        current_args = module_args if module_args is not None else args
+        
+        for node in gm.graph.nodes:
+            node_value = getattr(node, 'value', None)
+            if not isinstance(node_value, (torch.Tensor, tuple, list)):
+                continue
 
-    for node in model.graph.nodes:
-        node_value = getattr(node, 'value', None)
-        if not isinstance(node_value, (torch.Tensor, tuple, list)):
-            continue
-
-        op = Operation()
-
-        if node.op == 'placeholder':
-            tensor = Tensor()
-            set_tensor_field(tensor, node, output_dir, True)
-            model_params.inputs.append(tensor)
-            continue
-        elif node.op == 'get_attr' and "memory" in node.meta:
-            tensor = Tensor()
-            set_tensor_field(tensor, node, output_dir, True)
-            model_params.parameters.append(tensor)
-            continue
-        elif node.op == 'call_function':
-            op.op.CopyFrom(map_node(node, output_dir))
-        elif node.op == 'call_module':
-            gm = named_modules[node.target]
-            assert isinstance(gm, torch.fx.GraphModule)
-            submodule_args = torch.fx.node.map_arg(node.args, lambda n: n.value.clone())
-            ShapeProp(gm).propagate(*submodule_args)
-
-            operators = []
-            for n in gm.graph.nodes:
-                if n.op != 'call_function' or n.meta.get('fused', False) or _is_nop(n):
-                    continue
-                operators.append(map_node(n, output_dir))
-
-            op.fused_op.name = node.name
-            op.fused_op.op_list.extend(operators)
-        else:
-            continue
-
-        set_output_field(op, node, output_dir)
-
-        model_params.ops.append(op)
-
+            op = Operation()
+            
+            if node.op == 'placeholder':
+                tensor = Tensor()
+                set_tensor_field(tensor, node, output_dir, True)
+                model_params.inputs.append(tensor)
+                continue
+            elif node.op == 'get_attr' and "memory" in node.meta:
+                tensor = Tensor()
+                set_tensor_field(tensor, node, output_dir, True)
+                model_params.parameters.append(tensor)
+                continue
+            elif node.op == 'call_function':
+                op.op.CopyFrom(map_node(node, output_dir))
+                if "memory" in node.meta:  # Check if memory is allocated
+                    set_output_field(op, node, output_dir)
+                model_params.ops.append(op)
+            elif node.op == 'call_module':
+                submodule = named_modules[node.target]
+                if isinstance(submodule, torch.fx.GraphModule):
+                    submodule_args = torch.fx.node.map_arg(node.args, lambda n: n.value.clone())
+                    
+                    if should_fuse_module(submodule, max_fused_ops):
+                        fused_op = Operation()
+                        operators = []
+                        
+                        for n in submodule.graph.nodes:
+                            if n.op != 'call_function' or n.meta.get('fused', False) or _is_nop(n):
+                                continue
+                            operators.append(map_node(n, output_dir))
+                        
+                        fused_op.fused_op.name = node.name
+                        fused_op.fused_op.op_list.extend(operators)
+                        if "memory" in node.meta:  # Check if memory is allocated
+                            set_output_field(fused_op, node, output_dir)
+                        model_params.ops.append(fused_op)
+                    else:
+                        process_module(submodule, submodule_args)
+    
+    process_module(model)
     return model_params
+
+
+def should_fuse_module(module, max_fused_ops=None):
+    """
+    Determine whether a module should be fused based on various criteria.
+    """
+    if max_fused_ops is None:
+        return True  # Default to current behavior
+        
+    # Count operations that would be fused
+    op_count = sum(1 for node in module.graph.nodes 
+                  if node.op == 'call_function' and not node.meta.get('fused', False))
+    
+    # Don't fuse if too many operations
+    if op_count > max_fused_ops:
+        return False
+        
+    # Add additional criteria here as needed
+    # For example:
+    # - Memory usage
+    # - Operation types
+    # - Data dependencies
+    # - etc.
+    
+    return True
 
 
 def gen_compute_graph(model, output_file="compute_graph", max_users=10):
     nodes = {}
     edges = []
     named_modules = dict(model.named_modules(remove_duplicate=False))
+    
+    # First pass: collect all nodes including submodule operations
     for node in model.graph.nodes:
         if node.op == "get_attr" or not hasattr(node, "value"):
             continue
@@ -999,14 +1082,47 @@ def gen_compute_graph(model, output_file="compute_graph", max_users=10):
         else:
             continue
 
-        body = None
+        # Handle submodules by expanding their operations
         if node.op == "call_module":
             gm = named_modules[node.target]
             if isinstance(gm, torch.fx.GraphModule):
-                body = "&#92;n".join([
-                    n.name for n in gm.graph.nodes if n.op == "call_function"
-                ])
-        label = f"{{{header}}}" if body is None else f"{{{header}|{body}}}"
+                # Add nodes for each operation in the submodule
+                prev_node = None
+                for subnode in gm.graph.nodes:
+                    if subnode.op == "call_function":
+                        subnode_name = f"{node.name}_{subnode.name}"
+                        subnode_header = subnode.name
+                        if hasattr(subnode, "value") and isinstance(subnode.value, torch.Tensor):
+                            subnode_header += f"&#92;n{str(tuple(subnode.value.shape))}"
+                            if (dtype := subnode.meta.get("dtype", None)) is not None:
+                                subnode_header += f"&#92;n{dtype}"
+                        
+                        subnode_label = f"{{{subnode_header}}}"
+                        subnode_label = subnode_label.replace("<", "\<").replace(">", "\>")
+                        
+                        nodes[subnode_name] = {
+                            "label": subnode_label,
+                            "shape": "Mrecord",
+                        }
+                        
+                        # Connect submodule operations in sequence
+                        if prev_node:
+                            edges.append((prev_node, subnode_name))
+                        prev_node = subnode_name
+                        
+                        # Connect input edges from parent module's inputs
+                        for arg in subnode.args:
+                            if isinstance(arg, torch.fx.Node) and arg.op == "placeholder":
+                                edges.append((node.name, subnode_name))
+                
+                # Connect the last submodule operation to the parent module's output
+                if prev_node:
+                    for user in node.users:
+                        edges.append((prev_node, user.name))
+                continue
+
+        # For non-submodule nodes
+        label = f"{{{header}}}"
         label = label.replace("<", "\<").replace(">", "\>")
 
         nodes[node.name] = {
@@ -1014,6 +1130,7 @@ def gen_compute_graph(model, output_file="compute_graph", max_users=10):
             "shape": "Mrecord",
         }
 
+        # Handle edges for non-submodule nodes
         users = list(node.users)
         num_users = len(users)
         if num_users > max_users:
@@ -1023,7 +1140,6 @@ def gen_compute_graph(model, output_file="compute_graph", max_users=10):
                 sub_label = f"{{{sub_node}}}"
                 sub_label = sub_label.replace("<", "\<").replace(">", "\>")
 
-                # Create a sub-node for this group of users
                 nodes[sub_node] = {
                     "label": sub_label,
                     "shape": "Mrecord",
@@ -1031,7 +1147,6 @@ def gen_compute_graph(model, output_file="compute_graph", max_users=10):
 
                 edges.append((node.name, sub_node))
 
-                # Add edges from sub-node to its users
                 start_idx = i * max_users
                 end_idx = min(start_idx + max_users, num_users)
                 for u in users[start_idx:end_idx]:

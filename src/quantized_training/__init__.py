@@ -13,6 +13,7 @@ from .training_args import *
 from .utils import *
 from .histogram import *
 from .quantize_pt2e import fuse_quantize_dequantize_with_previous_op
+from .ee372_flash_attention import rename_graph_nodes
 from google.protobuf import text_format
 import operator
 
@@ -36,7 +37,7 @@ __all__ = [
     "plot_histogram",
     "plot_layer_range",
     "prepare",
-    "prepare_pt2e",
+    "prepare_pt2e_compiler",
     "print_node_scope_tabular",
     "propagate_config",
     "quantize",
@@ -46,6 +47,7 @@ __all__ = [
     "quantize_to_posit",
     "replace_softmax",
     "setup_logging",
+    "rename_graph_nodes",
 ]
 
 class qscheme: ...
@@ -110,13 +112,30 @@ def transform(
         ]
 
         ShapeProp(model).propagate(*flatten_args)
-        fuse_operator(model, vector_stages)
+        # fuse_operator(model, vector_stages)
 
     model.graph.print_tabular()
 
     new_out = model(*example_args, *list(example_kwargs.values()))
     return orig_out, new_out
 
+
+def allocate_memory_recursive(model, manager, named_modules):
+    """Recursively allocate memory for a model and its submodules"""
+    for node in model.graph.nodes:
+        if node.op == 'call_module':
+            submodule = named_modules[node.target]
+            if isinstance(submodule, torch.fx.GraphModule):
+                # Get submodule args for shape propagation
+                submodule_args = torch.fx.node.map_arg(node.args, lambda n: n.value.clone())
+                ShapeProp(submodule).propagate(*submodule_args)
+                
+                # Allocate memory for the submodule
+                allocate_weights(submodule, manager)
+                allocate_activations(submodule, manager)
+                
+                # Recursively handle nested submodules
+                allocate_memory_recursive(submodule, manager, named_modules)
 
 def compile(
     model: torch.fx.GraphModule,
@@ -126,6 +145,7 @@ def compile(
     bank_width=None,
     output_dir=None,
     output_file="compute_graph",
+    max_fused_ops=3,
 ):
     from torch.utils._pytree import tree_flatten
     flatten_args, spec = tree_flatten((example_args, example_kwargs))
@@ -133,10 +153,16 @@ def compile(
     ShapeProp(model).propagate(*flatten_args)
 
     manager = MemoryManager(total_memory, bank_width=bank_width)
+    named_modules = dict(model.named_modules(remove_duplicate=False))
+    
+    # Allocate memory for main model
     allocate_weights(model, manager)
     allocate_activations(model, manager)
+    
+    # Recursively allocate memory for submodules
+    allocate_memory_recursive(model, manager, named_modules)
 
-    model_params = gen_code(model, flatten_args, os.path.join(output_dir, "tensor_files"))
+    model_params = gen_code(model, flatten_args, os.path.join(output_dir, "tensor_files"), max_fused_ops=max_fused_ops)
 
     with open(os.path.join(output_dir, 'model.txt'), "w") as f:
         f.write(text_format.MessageToString(model_params))
@@ -144,7 +170,9 @@ def compile(
     with open(os.path.join(output_dir, 'layers.txt'), 'w') as f:
         for op in model_params.ops:
             if op.WhichOneof('op_type') == 'fused_op':
-                f.write(op.fused_op.name + '\n')
+                # Write each operation in the fused op
+                for subop in op.fused_op.op_list:
+                    f.write(subop.name + '\n')
             elif op.op.op != 'nop':
                 f.write(op.op.name + '\n')
 

@@ -34,7 +34,7 @@ def _save_tensor(tensor, filename):
     packed_data = struct.pack(f'{tensor.numel()}f', *tensor.tolist())
     with open(filename, 'wb') as f:
         f.write(packed_data)
-    print(f"Writing tensor to {filename}")
+    # print(f"Writing tensor to {filename}")
 
 
 def save_tensor(tensor, filename):
