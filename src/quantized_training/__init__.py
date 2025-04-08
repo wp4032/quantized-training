@@ -13,6 +13,7 @@ from .training_args import *
 from .utils import *
 from .histogram import *
 from .quantize_pt2e import fuse_quantize_dequantize_with_previous_op
+from .rename import rename_graph_nodes
 from google.protobuf import text_format
 import operator
 
@@ -76,6 +77,7 @@ def transform(
     example_args,
     example_kwargs=None,
     patterns=None,
+    model_name=None,
 ):
     if example_kwargs is None:
         example_kwargs = {}
@@ -101,6 +103,9 @@ def transform(
     # Move quantize and dequantize ops to the end of last compute op
     ShapeProp(model).propagate(*flatten_args)
     fuse_quantize_dequantize_with_previous_op(model)
+
+    if model_name == "MobileBertSelfAttention":
+        rename_graph_nodes(model.graph, "int8,qs=microscaling")
 
     for pattern in patterns:
         # If there is no corresponding mapping, we directly append the op itself
