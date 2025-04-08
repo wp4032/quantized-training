@@ -69,8 +69,10 @@ vector_stages = [
         ["div", "quantize"],
     ],
     [
-        ["layer_norm", torch.nn.Softmax, torch.nn.functional.softmax],
-        ["quantize"],
+        [],
+        [],
+        # ["layer_norm", torch.nn.Softmax, torch.nn.functional.softmax],
+        # ["quantize"],
     ]
 ]
 
@@ -102,9 +104,21 @@ if __name__ == "__main__":
         action="store_true",
         help="Quantize attention matrix multiplication using per-tensor symmetric quantization"
     )
+    parser.add_argument(
+        "--context_length",
+        type=int,
+        default=128,
+        choices=[16, 32, 64, 128, 256, 512],
+        help="Context length for the model"
+    )
+
+    
     add_qspec_args(parser)
     args = parser.parse_args()
 
+    if args.context_length < 0 or args.context_length > 512:
+        raise ValueError("Context length must be between 16 and 512")
+    
     quantizer = get_default_quantizer(
         input_activation=args.activation,
         output_activation=args.output_activation,
@@ -298,7 +312,7 @@ if __name__ == "__main__":
             texts = (
                 (examples[sentence1_key],) if sentence2_key is None else (examples[sentence1_key], examples[sentence2_key])
             )
-            result = tokenizer(*texts, padding="max_length", max_length=128, truncation=True)
+            result = tokenizer(*texts, padding="max_length", max_length=args.context_length, truncation=True)
             result["labels"] = examples["label"]
             return result
 
@@ -339,8 +353,8 @@ if __name__ == "__main__":
             model.bfloat16()
 
         example_args = (
-            torch.randn(1, 128, 512, dtype=torch_dtype),
-            torch.ones(1, 128, 128, dtype=torch_dtype),
+            torch.randn(1, args.context_length, 512, dtype=torch_dtype),
+            torch.ones(1, args.context_length, args.context_length, dtype=torch_dtype),
             None,
         )
 
