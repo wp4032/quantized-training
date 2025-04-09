@@ -11,11 +11,15 @@ def rename_graph_nodes(graph, quantization_scheme):
         'arg1_1': 'key_tensor',
         'arg2_1': 'value_tensor',
         'arg3_1': 'attention_mask',
-        'arg4_1': 'head_mask',
+        'arg4': 'head_mask',  # Fixed: changed from 'arg4_1' to 'arg4' to match actual arg name
     }
     for node in graph.nodes:
         if node.op == 'placeholder' and node.target in placeholder_mapping:
+            print(f"Renaming placeholder {node.target} to {placeholder_mapping[node.target]}")
             node.name = placeholder_mapping[node.target]
+            # Also rename the target for placeholders to ensure complete renaming
+            if node.target in placeholder_mapping:
+                node._target = placeholder_mapping[node.target]
 
     # --- Scheme-Specific Renaming --- 
     if "int8,qs=microscaling" in quantization_scheme:

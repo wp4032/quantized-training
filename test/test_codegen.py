@@ -385,7 +385,9 @@ if __name__ == "__main__":
 
         print(args.weight)
         # Rename nodes *after* transformations
-        if "int8,qs=microscaling" in args.weight: # Only rename for this specific scheme for now
+        if args.weight is None:
+            rename_graph_nodes(gm.graph, "CFLOAT") 
+        elif "int8,qs=microscaling" in args.weight: # Only rename for this specific scheme for now
             print_header("MobileBertEncoder: Renaming nodes")
             rename_graph_nodes(gm.graph, args.weight) 
         else:

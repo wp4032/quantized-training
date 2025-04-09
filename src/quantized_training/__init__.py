@@ -78,6 +78,7 @@ def transform(
     example_kwargs=None,
     patterns=None,
     model_name=None,
+    quantization_scheme=None,
 ):
     if example_kwargs is None:
         example_kwargs = {}
@@ -105,7 +106,10 @@ def transform(
     fuse_quantize_dequantize_with_previous_op(model)
 
     if model_name == "MobileBertSelfAttention":
-        rename_graph_nodes(model.graph, "int8,qs=microscaling")
+        if quantization_scheme is None:
+            rename_graph_nodes(model.graph, "CFLOAT")
+        else:
+            rename_graph_nodes(model.graph, quantization_scheme)
 
     for pattern in patterns:
         # If there is no corresponding mapping, we directly append the op itself
