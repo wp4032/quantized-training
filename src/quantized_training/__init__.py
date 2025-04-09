@@ -105,11 +105,11 @@ def transform(
     ShapeProp(model).propagate(*flatten_args)
     fuse_quantize_dequantize_with_previous_op(model)
 
-    if model_name == "MobileBertSelfAttention":
+    if model_name == "MobileBertSelfAttention" or model_name == "SelfAttention":
         if quantization_scheme is None:
-            rename_graph_nodes(model.graph, "CFLOAT")
+            rename_graph_nodes(model.graph, "CFLOAT", model_name)
         else:
-            rename_graph_nodes(model.graph, quantization_scheme)
+            rename_graph_nodes(model.graph, quantization_scheme, model_name)
 
     for pattern in patterns:
         # If there is no corresponding mapping, we directly append the op itself

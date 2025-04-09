@@ -149,6 +149,12 @@ if __name__ == "__main__":
         "output_file": args.model,
     }
 
+    def print_header(header):
+        text = f"== {header} =="
+        print("\n" + "=" * len(text))
+        print(text)
+        print("=" * len(text) + "\n")
+
     if args.model in TORCHVISION_MODELS:
         model = TORCHVISION_MODELS[args.model](pretrained=True).eval()
 
@@ -330,11 +336,6 @@ if __name__ == "__main__":
         compile(gm, example_args, **compile_args)
 
     elif "mobilebert_attention" in args.model:
-        def print_header(header):
-            text = f"== {header} =="
-            print("\n" + "=" * len(text))
-            print(text)
-            print("=" * len(text) + "\n")
 
         if args.model_name_or_path is None:
             args.model_name_or_path = "google/mobilebert-uncased"
@@ -383,19 +384,52 @@ if __name__ == "__main__":
         print_header("MobileBertEncoder: Transforming")
         orig_output, new_output = transform(gm, example_args, patterns=vector_stages, model_name="MobileBertSelfAttention")
 
-        print(args.weight)
+        print(args.model)
         # Rename nodes *after* transformations
         if args.weight is None:
-            rename_graph_nodes(gm.graph, "CFLOAT") 
+            rename_graph_nodes(gm.graph, "CFLOAT", args.model) 
         elif "int8,qs=microscaling" in args.weight: # Only rename for this specific scheme for now
             print_header("MobileBertEncoder: Renaming nodes")
-            rename_graph_nodes(gm.graph, args.weight) 
+            rename_graph_nodes(gm.graph, args.weight, args.model) 
         else:
-            rename_graph_nodes(gm.graph, "CFLOAT") 
+            rename_graph_nodes(gm.graph, "CFLOAT", args.model) 
 
         gm.graph.print_tabular()
 
         print_header("MobileBertEncoder: Compiling")
+        compile(gm, example_args, **compile_args)
+
+        orig_output = orig_output[0]
+        new_output = new_output[0]
+
+    elif args.model == "self_attention":
+        print_header("SelfAttention: Preparing Quantization")
+        class SelfAttention(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+
+            def forward(self, query_tensor, key_tensor, value_tensor):
+                QK = torch.matmul(query_tensor, key_tensor.transpose(-2, -1))
+                softmax_QK = torch.nn.functional.softmax(QK, dim=-1)
+                return torch.matmul(softmax_QK, value_tensor)
+
+        query_tensor = torch.randn(1, args.context_length, 64, dtype=torch_dtype)
+        key_tensor = torch.randn(1, args.context_length, 64, dtype=torch_dtype)
+        value_tensor = torch.randn(1, args.context_length, 64, dtype=torch_dtype)
+        example_args = (query_tensor, key_tensor, value_tensor)
+
+        gm = prepare_pt2e(SelfAttention(), quantizer, example_args)
+
+        for i in range(3):
+            gm(*example_args)
+
+        print_header("SelfAttention: Converting to PT2E")
+        convert_pt2e(gm, args.bias)
+
+        print_header("SelfAttention: Transforming")
+        orig_output, new_output = transform(gm, example_args, patterns=vector_stages, model_name="SelfAttention")
+
+        print_header("SelfAttention: Compiling")
         compile(gm, example_args, **compile_args)
 
         orig_output = orig_output[0]
