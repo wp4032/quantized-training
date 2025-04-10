@@ -382,17 +382,17 @@ if __name__ == "__main__":
         convert_pt2e(gm, args.bias)
 
         print_header("MobileBertEncoder: Transforming")
-        orig_output, new_output = transform(gm, example_args, patterns=vector_stages, model_name="MobileBertSelfAttention")
+        orig_output, new_output = transform(gm, example_args, patterns=vector_stages, model_name="MobileBertSelfAttention", quantization_scheme=args.weight)
 
         print(args.model)
         # Rename nodes *after* transformations
-        if args.weight is None:
-            rename_graph_nodes(gm.graph, "CFLOAT", args.model) 
-        elif "int8,qs=microscaling" in args.weight: # Only rename for this specific scheme for now
-            print_header("MobileBertEncoder: Renaming nodes")
-            rename_graph_nodes(gm.graph, args.weight, args.model) 
-        else:
-            rename_graph_nodes(gm.graph, "CFLOAT", args.model) 
+        # if args.weight is None:
+        #     rename_graph_nodes(gm.graph, "CFLOAT", "MobileBertSelfAttention") 
+        # elif "int8,qs=microscaling" in args.weight: # Only rename for this specific scheme for now
+        #     print_header("MobileBertEncoder: Renaming nodes")
+        #     rename_graph_nodes(gm.graph, args.weight, "MobileBertSelfAttention") 
+        # else:
+        #     rename_graph_nodes(gm.graph, "CFLOAT", "MobileBertSelfAttention") 
 
         gm.graph.print_tabular()
 
@@ -427,7 +427,7 @@ if __name__ == "__main__":
         convert_pt2e(gm, args.bias)
 
         print_header("SelfAttention: Transforming")
-        orig_output, new_output = transform(gm, example_args, patterns=vector_stages, model_name="SelfAttention")
+        orig_output, new_output = transform(gm, example_args, patterns=vector_stages, model_name="SelfAttention", quantization_scheme=args.weight)
 
         print_header("SelfAttention: Compiling")
         compile(gm, example_args, **compile_args)
