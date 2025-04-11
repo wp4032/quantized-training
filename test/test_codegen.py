@@ -108,12 +108,7 @@ if __name__ == "__main__":
         default=512,
         help="Context length for the LLM decoding."
     )
-    parser.add_argument(
-        "--context_length",
-        type=int,
-        default=512,
-        help="Context length for the LLM decoding."
-    )
+
     add_qspec_args(parser)
     args = parser.parse_args()
 
@@ -322,60 +317,7 @@ if __name__ == "__main__":
         quantizer.set_module_name("classifier", None)
 
         gm = prepare_pt2e(MobileBertNoEmbed(), quantizer, example_args)
-        # Setup SST-2 dataset
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
-        raw_datasets = load_dataset("glue", args.task_name)
-
-        sentence1_key, sentence2_key = task_to_keys[args.task_name]
-
-        def preprocess_function(examples):
-            # Tokenize the texts
-            texts = (
-                (examples[sentence1_key],) if sentence2_key is None else (examples[sentence1_key], examples[sentence2_key])
-            )
-            # Use args.context_length instead of hardcoded 128
-            result = tokenizer(*texts, padding="max_length", max_length=args.context_length, truncation=True)
-            result["labels"] = examples["label"]
-            return result
-
-        processed_datasets = raw_datasets.map(
-            preprocess_function,
-            batched=True,
-            remove_columns=raw_datasets["train"].column_names,
-            desc="Running tokenizer on dataset",
-        )
-
-        train_dataset = processed_datasets["train"]
-        train_dataloader = DataLoader(train_dataset, collate_fn=default_data_collator, batch_size=1)
-
-        batch = next(iter(train_dataloader))
-        embedding_output = model.mobilebert.embeddings(
-            input_ids=batch["input_ids"],
-            token_type_ids=batch["token_type_ids"]
-        )
-        extended_attention_mask = model.mobilebert.get_extended_attention_mask(
-            batch["attention_mask"], batch["input_ids"].size()
-        )
-        head_mask = model.mobilebert.get_head_mask(None, model.config.num_hidden_layers)
-
-        example_args = (embedding_output, extended_attention_mask, head_mask)
-
-        class MobileBertNoEmbed(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.mobilebert = model.mobilebert
-                self.classifier = model.classifier
-
-            def forward(self, *args, **kwargs):
-                hidden_states = self.mobilebert.encoder(*args, **kwargs, return_dict=False)[0]
-                first_token_tensor = hidden_states[:, 0]
-                output = self.classifier(first_token_tensor)
-                return output
-
-        quantizer.set_module_name("classifier", None)
-
-        gm = prepare_pt2e(MobileBertNoEmbed(), quantizer, example_args)
-
+        
         for step, batch in enumerate(tqdm(train_dataloader)):
             embedding_output = model.mobilebert.embeddings(
                 input_ids=batch["input_ids"],
