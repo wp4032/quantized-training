@@ -27,6 +27,7 @@ from quantized_training import (
     transform,
     compile,
     derive_bias_qparams_fn,
+    specific_compile,
     rename_graph_nodes,
 )
 from quantized_training.codegen.utils import (
@@ -397,26 +398,46 @@ if __name__ == "__main__":
         gm.graph.print_tabular()
 
         print_header("MobileBertEncoder: Compiling")
-        compile(gm, example_args, **compile_args)
+        nodes_to_compile = ["qk_matmul_module", "softmax", "av_matmul"]
+        specific_compile(gm, example_args, nodes_to_compile=nodes_to_compile, **compile_args)
 
         orig_output = orig_output[0]
         new_output = new_output[0]
 
     elif args.model == "self_attention":
         print_header("SelfAttention: Preparing Quantization")
+        # class SelfAttention(torch.nn.Module):
+        #     def __init__(self):
+        #         super().__init__()
+
+        #     def forward(self, query_tensor, key_tensor, value_tensor):
+        #         QK = torch.matmul(query_tensor, key_tensor.transpose(-2, -1))
+        #         softmax_QK = torch.nn.functional.softmax(QK, dim=-1)
+        #         return torch.matmul(softmax_QK, value_tensor)
+            
         class SelfAttention(torch.nn.Module):
             def __init__(self):
                 super().__init__()
 
-            def forward(self, query_tensor, key_tensor, value_tensor):
-                QK = torch.matmul(query_tensor, key_tensor.transpose(-2, -1))
-                softmax_QK = torch.nn.functional.softmax(QK, dim=-1)
-                return torch.matmul(softmax_QK, value_tensor)
+            def forward(self, query_tile, key_tensor):
+                QK = torch.matmul(query_tile, key_tensor.T)
+                # m = torch.max(QK, dim=-1, keepdim=True)
+                # P = QK - m.values
+                # Pexp = torch.exp(P)
+                # Psum = torch.sum(Pexp, dim=-1, keepdim=True)
+                # P = Pexp / (Psum + 1e-6)
+                return QK
 
-        query_tensor = torch.randn(1, args.context_length, 64, dtype=torch_dtype)
-        key_tensor = torch.randn(1, args.context_length, 64, dtype=torch_dtype)
-        value_tensor = torch.randn(1, args.context_length, 64, dtype=torch_dtype)
-        example_args = (query_tensor, key_tensor, value_tensor)
+        Q = torch.arange(64 * 64).reshape(64, 64).float() / 10000
+        K = torch.arange(64 * 64, 64 * 64 + 64 * 64).reshape(64, 64).float() / 10000
+        query_tile = Q[0:32]
+        key_tensor = K[0:32]
+        print(query_tile)
+        print(key_tensor)
+        # query_tensor = torch.randn(1, args.context_length, 64, dtype=torch_dtype)
+        # key_tensor = torch.randn(1, args.context_length, 64, dtype=torch_dtype)
+        # value_tensor = torch.randn(1, args.context_length, 64, dtype=torch_dtype)
+        example_args = (query_tile, key_tensor)
 
         gm = prepare_pt2e(SelfAttention(), quantizer, example_args)
 
