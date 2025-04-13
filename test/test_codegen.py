@@ -386,19 +386,16 @@ if __name__ == "__main__":
         orig_output, new_output = transform(gm, example_args, patterns=vector_stages, model_name="MobileBertSelfAttention", quantization_scheme=args.weight)
 
         print(args.model)
-        # Rename nodes *after* transformations
-        # if args.weight is None:
-        #     rename_graph_nodes(gm.graph, "CFLOAT", "MobileBertSelfAttention") 
-        # elif "int8,qs=microscaling" in args.weight: # Only rename for this specific scheme for now
-        #     print_header("MobileBertEncoder: Renaming nodes")
-        #     rename_graph_nodes(gm.graph, args.weight, "MobileBertSelfAttention") 
-        # else:
-        #     rename_graph_nodes(gm.graph, "CFLOAT", "MobileBertSelfAttention") 
 
         gm.graph.print_tabular()
 
         print_header("MobileBertEncoder: Compiling")
-        nodes_to_compile = ["qk_matmul_module", "softmax", "av_matmul"]
+
+        if "int8,qs=microscaling" in args.weight:
+            nodes_to_compile = ["qk_matmul_module", "softmax_module", "av_matmul"]          # TODO: "key_proj_mx_module", "query_proj_mx_module", "value_proj_mx_module", "qk_matmul_module", "softmax_module", "av_matmul"
+        else:
+            nodes_to_compile = ["qk_matmul_module", "softmax", "av_matmul"]                 # TODO: "key_proj_mx_module", "query_proj_mx_module", "value_proj_mx_module", "qk_matmul_module", "softmax_module", "av_matmul"
+
         specific_compile(gm, example_args, nodes_to_compile=nodes_to_compile, **compile_args)
 
         orig_output = orig_output[0]
@@ -406,38 +403,19 @@ if __name__ == "__main__":
 
     elif args.model == "self_attention":
         print_header("SelfAttention: Preparing Quantization")
-        # class SelfAttention(torch.nn.Module):
-        #     def __init__(self):
-        #         super().__init__()
-
-        #     def forward(self, query_tensor, key_tensor, value_tensor):
-        #         QK = torch.matmul(query_tensor, key_tensor.transpose(-2, -1))
-        #         softmax_QK = torch.nn.functional.softmax(QK, dim=-1)
-        #         return torch.matmul(softmax_QK, value_tensor)
-            
         class SelfAttention(torch.nn.Module):
             def __init__(self):
                 super().__init__()
 
-            def forward(self, query_tile, key_tensor):
-                QK = torch.matmul(query_tile, key_tensor.T)
-                # m = torch.max(QK, dim=-1, keepdim=True)
-                # P = QK - m.values
-                # Pexp = torch.exp(P)
-                # Psum = torch.sum(Pexp, dim=-1, keepdim=True)
-                # P = Pexp / (Psum + 1e-6)
-                return QK
+            def forward(self, query_tensor, key_tensor, value_tensor):
+                QK = torch.matmul(query_tensor, key_tensor.transpose(-2, -1))
+                softmax_QK = torch.nn.functional.softmax(QK, dim=-1)
+                return torch.matmul(softmax_QK, value_tensor)
 
-        Q = torch.arange(64 * 64).reshape(64, 64).float() / 10000
-        K = torch.arange(64 * 64, 64 * 64 + 64 * 64).reshape(64, 64).float() / 10000
-        query_tile = Q[0:32]
-        key_tensor = K[0:32]
-        print(query_tile)
-        print(key_tensor)
-        # query_tensor = torch.randn(1, args.context_length, 64, dtype=torch_dtype)
-        # key_tensor = torch.randn(1, args.context_length, 64, dtype=torch_dtype)
-        # value_tensor = torch.randn(1, args.context_length, 64, dtype=torch_dtype)
-        example_args = (query_tile, key_tensor)
+        query_tensor = torch.randn(1, args.context_length, 64, dtype=torch_dtype)
+        key_tensor = torch.randn(1, args.context_length, 64, dtype=torch_dtype)
+        value_tensor = torch.randn(1, args.context_length, 64, dtype=torch_dtype)
+        example_args = (query_tensor, key_tensor, value_tensor)
 
         gm = prepare_pt2e(SelfAttention(), quantizer, example_args)
 
