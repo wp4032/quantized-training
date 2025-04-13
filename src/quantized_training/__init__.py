@@ -158,3 +158,40 @@ def compile(
                 f.write(op.op.name + '\n')
 
     gen_compute_graph(model, os.path.join(output_dir, output_file))
+
+def specific_compile(
+    model: torch.fx.GraphModule,
+    example_args,
+    example_kwargs=None,
+    total_memory=None,
+    bank_width=None,
+    output_dir=None,
+    output_file="compute_graph",
+    nodes_to_compile=None,
+):
+    from torch.utils._pytree import tree_flatten
+    flatten_args, spec = tree_flatten((example_args, example_kwargs))
+
+    ShapeProp(model).propagate(*flatten_args)
+
+    manager = MemoryManager(total_memory, bank_width=bank_width)
+    allocate_weights(model, manager)
+    allocate_activations(model, manager)
+
+    model_params = gen_code(model, flatten_args, os.path.join(output_dir, "tensor_files"))
+
+    with open(os.path.join(output_dir, 'model.txt'), "w") as f:
+        f.write(text_format.MessageToString(model_params))
+
+    with open(os.path.join(output_dir, 'layers.txt'), 'w') as f:
+        if nodes_to_compile is None:
+            for op in model_params.ops:
+                if op.WhichOneof('op_type') == 'fused_op':
+                    f.write(op.fused_op.name + '\n')
+                elif op.op.op != 'nop':
+                    f.write(op.op.name + '\n')
+        else:
+            for op in nodes_to_compile:
+                f.write(op + '\n')
+
+    gen_compute_graph(model, os.path.join(output_dir, output_file))

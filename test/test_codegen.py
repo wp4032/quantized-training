@@ -27,6 +27,7 @@ from quantized_training import (
     transform,
     compile,
     derive_bias_qparams_fn,
+    specific_compile,
     rename_graph_nodes,
 )
 from quantized_training.codegen.utils import (
@@ -385,19 +386,17 @@ if __name__ == "__main__":
         orig_output, new_output = transform(gm, example_args, patterns=vector_stages, model_name="MobileBertSelfAttention", quantization_scheme=args.weight)
 
         print(args.model)
-        # Rename nodes *after* transformations
-        # if args.weight is None:
-        #     rename_graph_nodes(gm.graph, "CFLOAT", "MobileBertSelfAttention") 
-        # elif "int8,qs=microscaling" in args.weight: # Only rename for this specific scheme for now
-        #     print_header("MobileBertEncoder: Renaming nodes")
-        #     rename_graph_nodes(gm.graph, args.weight, "MobileBertSelfAttention") 
-        # else:
-        #     rename_graph_nodes(gm.graph, "CFLOAT", "MobileBertSelfAttention") 
 
         gm.graph.print_tabular()
 
         print_header("MobileBertEncoder: Compiling")
-        compile(gm, example_args, **compile_args)
+
+        if "int8,qs=microscaling" in args.weight:
+            nodes_to_compile = ["qk_matmul_module", "softmax_module", "av_matmul"]          # TODO: "key_proj_mx_module", "query_proj_mx_module", "value_proj_mx_module", "qk_matmul_module", "softmax_module", "av_matmul"
+        else:
+            nodes_to_compile = ["qk_matmul_module", "softmax", "av_matmul"]                 # TODO: "key_proj_mx_module", "query_proj_mx_module", "value_proj_mx_module", "qk_matmul_module", "softmax_module", "av_matmul"
+
+        specific_compile(gm, example_args, nodes_to_compile=nodes_to_compile, **compile_args)
 
         orig_output = orig_output[0]
         new_output = new_output[0]
