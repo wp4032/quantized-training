@@ -384,10 +384,6 @@ if __name__ == "__main__":
         print_header("MobileBertEncoder: Transforming")
         orig_output, new_output = transform(gm, example_args, patterns=vector_stages, model_name="MobileBertSelfAttention", quantization_scheme=args.weight)
 
-        print(args.model)
-
-        gm.graph.print_tabular()
-
         print_header("MobileBertEncoder: Compiling")
 
         if "int8,qs=microscaling" in args.weight:
