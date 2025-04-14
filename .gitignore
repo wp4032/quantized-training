@@ -11,7 +11,7 @@ logs
 models
 plots
 slurm_scripts
-# test
-# !test/test_codgen.py
+test/*
+!test/test_codegen.py
 wandb
 .vscode
