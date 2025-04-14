@@ -5,19 +5,18 @@ def rename_graph_nodes(graph, quantization_scheme, model_name):
         graph: The torch.fx.Graph object.
         quantization_scheme: The quantization scheme string (e.g., 'int8,qs=microscaling,bs=16').
     """
-    # --- Initial Placeholder Renaming (Applies to all schemes) ---
+    # --- Initial Input Renaming ---
     placeholder_mapping = {
-        'arg0_1': 'query_tensor', # Adjust based on actual placeholder names if different
+        'arg0_1': 'query_tensor',
         'arg1_1': 'key_tensor',
         'arg2_1': 'value_tensor',
         'arg3_1': 'attention_mask',
-        'arg4': 'head_mask',  # Fixed: changed from 'arg4_1' to 'arg4' to match actual arg name
+        'arg4': 'head_mask', 
     }
     for node in graph.nodes:
         if node.op == 'placeholder' and node.name in placeholder_mapping:
             print(f"Renaming placeholder {node.name} to {placeholder_mapping[node.name]}")
             node.name = placeholder_mapping[node.name]
-            # Also rename the target for placeholders to ensure complete renaming
             if node.name in placeholder_mapping:
                 node.target = placeholder_mapping[node.target]
 
@@ -38,15 +37,9 @@ def rename_graph_nodes(graph, quantization_scheme, model_name):
                 'matmul_mx_5': 'av_matmul_1', 
                 'matmul_mx_6': 'av_matmul_2', 
                 'matmul_mx_7': 'av_matmul_3', 
-                # --- You can add more specific renames here if needed --- 
-                # Example: Renaming the linear projections if they have consistent names post-conversion
                 'linear_mx_default': 'query_proj_mx',
                 'linear_mx_default_1': 'key_proj_mx',
                 'linear_mx_default_2': 'value_proj_mx',
-                
-                # Example: Renaming intermediate nodes like softmax, dropout if names are stable
-                # 'softmax': 'attn_softmax',
-                # 'dropout': 'attn_dropout',
             }
         elif quantization_scheme == "CFLOAT":
             specific_mapping = {
@@ -90,19 +83,9 @@ def rename_graph_nodes(graph, quantization_scheme, model_name):
                 unique_name = f"{new_name}_{count}"
                 count += 1
             
-            print(f"Renaming {node.name} to {unique_name}") # Debug print
+            print(f"Renaming {node.name} to {unique_name}") 
             node.name = unique_name
-            renamed_nodes.add(unique_name) # Track renamed nodes to avoid re-renaming in the same pass
-
-    # --- Generic Renaming (Can be applied to all schemes, potentially less precise) ---
-    # This is the old mapping, kept here for reference or potential generic use.
-    # It might not work reliably after transformations.
-    # generic_mapping = {
-    #     # ... (keep the old large mapping here if you want a fallback)
-    # }
-    # for node in graph.nodes:
-    #     if node.name in generic_mapping:
-    #         node.name = generic_mapping[node.name]
+            renamed_nodes.add(unique_name) 
 
     # Relint the graph after renaming to ensure validity
     graph.lint()
