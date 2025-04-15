@@ -345,7 +345,7 @@ def _create_and_insert_subgraph(
     submodule, new_args = _create_subgraph(nodes)
     # TODO: cleaner fix for transpose
     if ("transpose" in nodes[0].name):
-        node_name = f"{nodes[1].name}_module"
+        node_name = f"{nodes[1].name}_module_T"
     else:
         node_name = f"{nodes[0].name}_module"
     print("node_name", node_name)
