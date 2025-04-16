@@ -386,10 +386,12 @@ if __name__ == "__main__":
 
         print_header("MobileBertEncoder: Compiling")
 
-        if "int8,qs=microscaling" in args.weight:
-            nodes_to_compile = ["qk_matmul_module", "softmax_module", "av_matmul"]          # TODO: "key_proj_mx_module", "query_proj_mx_module", "value_proj_mx_module", "qk_matmul_module", "softmax_module", "av_matmul"
+        if args.weight is None:
+            nodes_to_compile = ["qk_matmul_module_t", "softmax", "av_matmul"]
+        elif "int8,qs=microscaling" in args.weight:
+            nodes_to_compile = ["qk_matmul_module_t", "softmax_module", "av_matmul"]          # TODO: "key_proj_mx_module", "query_proj_mx_module", "value_proj_mx_module", "qk_matmul_module", "softmax_module", "av_matmul"
         else:
-            nodes_to_compile = ["qk_matmul_module", "softmax", "av_matmul"]                 # TODO: "key_proj_mx_module", "query_proj_mx_module", "value_proj_mx_module", "qk_matmul_module", "softmax_module", "av_matmul"
+            nodes_to_compile = ["qk_matmul_module_t", "softmax", "av_matmul"]                 # TODO: "key_proj_mx_module", "query_proj_mx_module", "value_proj_mx_module", "qk_matmul_module", "softmax_module", "av_matmul"
 
         specific_compile(gm, example_args, nodes_to_compile=nodes_to_compile, **compile_args)
 
