@@ -106,7 +106,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--context_length",
         type=int,
-        default=512,
+        default=128,
         help="Context length for the LLM decoding."
     )
     add_qspec_args(parser)
