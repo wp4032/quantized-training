@@ -26,7 +26,9 @@ from quantized_training import (
     prepare_pt2e,
     transform,
     compile,
-    derive_bias_qparams_fn
+    derive_bias_qparams_fn,
+    specific_compile,
+    rename_graph_nodes,
 )
 from quantized_training.codegen.utils import (
     get_conv_bn_layers,
@@ -104,11 +106,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "--context_length",
         type=int,
-        default=512,
+        default=128,
         help="Context length for the LLM decoding."
     )
     add_qspec_args(parser)
     args = parser.parse_args()
+
+    if args.model == "mobilebert" or args.model == "mobilebert_encoder":
+        if args.context_length > 512:
+            raise ValueError(f"{args.model} only supports context length <= 512")
 
     quantizer = get_default_quantizer(
         input_activation=args.activation,
@@ -143,6 +149,12 @@ if __name__ == "__main__":
         "output_dir": args.output_dir,
         "output_file": args.model,
     }
+
+    def print_header(header):
+        text = f"== {header} =="
+        print("\n" + "=" * len(text))
+        print(text)
+        print("=" * len(text) + "\n")
 
     if args.model in TORCHVISION_MODELS:
         model = TORCHVISION_MODELS[args.model](pretrained=True).eval()
@@ -322,6 +334,142 @@ if __name__ == "__main__":
 
         orig_output, new_output = transform(gm, example_args, patterns=vector_stages)
         compile(gm, example_args, **compile_args)
+
+    elif "mobilebert_attention" in args.model:
+
+        if args.model_name_or_path is None:
+            args.model_name_or_path = "google/mobilebert-uncased"
+        model = AutoModelForSequenceClassification.from_pretrained(args.model_name_or_path).eval()
+        
+        if args.bf16:
+            model.bfloat16()
+
+        example_args = (
+            torch.randn(1, args.context_length, model.config.true_hidden_size, dtype=torch_dtype),      # query_tensor
+            torch.randn(1, args.context_length, model.config.true_hidden_size, dtype=torch_dtype),      # key_tensor
+            torch.randn(1, args.context_length, model.config.hidden_size, dtype=torch_dtype),           # value_tensor
+            torch.ones(1, args.context_length, args.context_length, dtype=torch_dtype),                 # attention_mask
+            None,                                                                                       # head_mask
+        )
+
+        class MobileBertSelfAttention(torch.nn.Module):
+            def __init__(self, model):
+                super().__init__()
+                self.attention = model.mobilebert.encoder.layer[0].attention.self
+
+            def forward(self, query_tensor, key_tensor, value_tensor, attention_mask=None, head_mask=None):
+                return self.attention(
+                    query_tensor,
+                    key_tensor,
+                    value_tensor,
+                    attention_mask,
+                    head_mask
+                )
+
+        # Insert observers / fake quantization modules
+        print_header("MobileBertEncoder: Preparing Quantization")
+        gm = prepare_pt2e(MobileBertSelfAttention(model), quantizer, example_args)
+        
+        # Calibrate quantization using random inputs
+        for i in range(3):
+            gm(*example_args)
+
+        for name, module in gm.named_modules():
+            if hasattr(module, "scale"):
+                print(module.scale)
+
+        print_header("MobileBertEncoder: Converting to PT2E")
+        convert_pt2e(gm, args.bias)
+
+        print_header("MobileBertEncoder: Transforming")
+        orig_output, new_output = transform(gm, example_args, patterns=vector_stages, model_name="MobileBertSelfAttention", quantization_scheme=args.weight)
+
+        print_header("MobileBertEncoder: Compiling")
+
+        if args.weight is None:
+            nodes_to_compile = ["qk_matmul_module_t", "softmax", "av_matmul"]
+        elif "int8,qs=microscaling" in args.weight:
+            nodes_to_compile = ["qk_matmul_module_t", "softmax_module", "av_matmul"]          # TODO: "key_proj_mx_module", "query_proj_mx_module", "value_proj_mx_module", "qk_matmul_module", "softmax_module", "av_matmul"
+        else:
+            nodes_to_compile = ["qk_matmul_module_t", "softmax", "av_matmul"]                 # TODO: "key_proj_mx_module", "query_proj_mx_module", "value_proj_mx_module", "qk_matmul_module", "softmax_module", "av_matmul"
+
+        specific_compile(gm, example_args, nodes_to_compile=nodes_to_compile, **compile_args)
+
+        orig_output = orig_output[0]
+        new_output = new_output[0]
+
+    elif args.model == "self_attention":
+        print_header("SelfAttention: Preparing Quantization")
+        class SelfAttention(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+
+            def forward(self, query_tensor, key_tensor, value_tensor):
+                QK = torch.matmul(query_tensor, key_tensor.transpose(-2, -1))
+                softmax_QK = torch.nn.functional.softmax(QK, dim=-1)
+                return torch.matmul(softmax_QK, value_tensor)
+
+        query_tensor = torch.randn(1, args.context_length, 64, dtype=torch_dtype)
+        key_tensor = torch.randn(1, args.context_length, 64, dtype=torch_dtype)
+        value_tensor = torch.randn(1, args.context_length, 64, dtype=torch_dtype)
+        example_args = (query_tensor, key_tensor, value_tensor)
+
+        gm = prepare_pt2e(SelfAttention(), quantizer, example_args)
+
+        for i in range(3):
+            gm(*example_args)
+
+        print_header("SelfAttention: Converting to PT2E")
+        convert_pt2e(gm, args.bias)
+
+        print_header("SelfAttention: Transforming")
+        orig_output, new_output = transform(gm, example_args, patterns=vector_stages, model_name="SelfAttention", quantization_scheme=args.weight)
+
+        print_header("SelfAttention: Compiling")
+        compile(gm, example_args, **compile_args)
+
+        orig_output = orig_output[0]
+        new_output = new_output[0]
+
+    elif args.model == "flash_attention":
+        print_header("FlashAttention: Preparing Quantization")
+        class FlashAttention(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+
+            def forward(self, query_tile, key_tile, value_tile, max_vector, sum_vector):
+                S = torch.matmul(query_tile, key_tile.transpose(-2, -1))
+                P = torch.nn.functional.softmax(S, dim=-1)
+                return torch.matmul(P, value_tile)
+
+        query_tensor = torch.randn(1, 64, 64, dtype=torch_dtype)
+        key_tensor = torch.randn(1, 64, 64, dtype=torch_dtype)
+        value_tensor = torch.randn(1, 64, 64, dtype=torch_dtype)
+        max_vector = torch.ones(1, 32, dtype=torch_dtype)
+        sum_vector = torch.ones(1, 32, dtype=torch_dtype)
+
+        query_tile = query_tensor[:, :32, :]
+        key_tile   = key_tensor[:, :32, :]
+        value_tile = value_tensor[:, :32, :]
+        example_args = (query_tile, key_tile, value_tile, max_vector, sum_vector)
+
+        gm = prepare_pt2e(FlashAttention(), quantizer, example_args)
+
+        for i in range(3):
+            gm(*example_args)
+
+        print_header("SelfAttention: Converting to PT2E")
+        convert_pt2e(gm, args.bias)
+
+        print_header("SelfAttention: Transforming")
+        orig_output, new_output = transform(gm, example_args, patterns=vector_stages, model_name="SelfAttention", quantization_scheme=args.weight)
+
+        print_header("SelfAttention: Compiling")
+        compile(gm, example_args, **compile_args)
+
+        orig_output = orig_output[0]
+        new_output = new_output[0]
+
     elif args.model == "mobilebert_encoder":
         if args.model_name_or_path is None:
             args.model_name_or_path = "google/mobilebert-uncased"
@@ -331,8 +479,8 @@ if __name__ == "__main__":
             model.bfloat16()
 
         example_args = (
-            torch.randn(1, 128, 512, dtype=torch_dtype),
-            torch.ones(1, 128, 128, dtype=torch_dtype),
+            torch.randn(1, args.context_length, 512, dtype=torch_dtype),
+            torch.ones(1, args.context_length, args.context_length, dtype=torch_dtype),
             None,
         )
 
@@ -360,6 +508,7 @@ if __name__ == "__main__":
 
         orig_output = orig_output[0]
         new_output = new_output[0]
+
     elif args.model == "bert":
         if args.model_name_or_path is None:
             args.model_name_or_path = "bert-base-uncased"
@@ -698,3 +847,4 @@ if __name__ == "__main__":
         print(e)
         print(orig_output)
         print(new_output)
+
