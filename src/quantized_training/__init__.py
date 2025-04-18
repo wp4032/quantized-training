@@ -13,6 +13,7 @@ from .training_args import *
 from .utils import *
 from .histogram import *
 from .quantize_pt2e import fuse_quantize_dequantize_with_previous_op
+from .rename import rename_graph_nodes
 from google.protobuf import text_format
 import operator
 
@@ -76,6 +77,8 @@ def transform(
     example_args,
     example_kwargs=None,
     patterns=None,
+    model_name=None,
+    quantization_scheme=None,
 ):
     if example_kwargs is None:
         example_kwargs = {}
@@ -101,6 +104,12 @@ def transform(
     # Move quantize and dequantize ops to the end of last compute op
     ShapeProp(model).propagate(*flatten_args)
     fuse_quantize_dequantize_with_previous_op(model)
+
+    if model_name == "MobileBertSelfAttention" or model_name == "SelfAttention":
+        if quantization_scheme is None:
+            rename_graph_nodes(model.graph, "CFLOAT", model_name)
+        else:
+            rename_graph_nodes(model.graph, quantization_scheme, model_name)
 
     for pattern in patterns:
         # If there is no corresponding mapping, we directly append the op itself
@@ -147,5 +156,42 @@ def compile(
                 f.write(op.fused_op.name + '\n')
             elif op.op.op != 'nop':
                 f.write(op.op.name + '\n')
+
+    gen_compute_graph(model, os.path.join(output_dir, output_file))
+
+def specific_compile(
+    model: torch.fx.GraphModule,
+    example_args,
+    example_kwargs=None,
+    total_memory=None,
+    bank_width=None,
+    output_dir=None,
+    output_file="compute_graph",
+    nodes_to_compile=None,
+):
+    from torch.utils._pytree import tree_flatten
+    flatten_args, spec = tree_flatten((example_args, example_kwargs))
+
+    ShapeProp(model).propagate(*flatten_args)
+
+    manager = MemoryManager(total_memory, bank_width=bank_width)
+    allocate_weights(model, manager)
+    allocate_activations(model, manager)
+
+    model_params = gen_code(model, flatten_args, os.path.join(output_dir, "tensor_files"))
+
+    with open(os.path.join(output_dir, 'model.txt'), "w") as f:
+        f.write(text_format.MessageToString(model_params))
+
+    with open(os.path.join(output_dir, 'layers.txt'), 'w') as f:
+        if nodes_to_compile is None:
+            for op in model_params.ops:
+                if op.WhichOneof('op_type') == 'fused_op':
+                    f.write(op.fused_op.name + '\n')
+                elif op.op.op != 'nop':
+                    f.write(op.op.name + '\n')
+        else:
+            for op in nodes_to_compile:
+                f.write(op + '\n')
 
     gen_compute_graph(model, os.path.join(output_dir, output_file))

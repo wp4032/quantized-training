@@ -336,14 +336,19 @@ def _create_subgraph(nodes: List[Node]):
     return gm, tuple(new_args)
 
 
+# TODO: fix this
 def _create_and_insert_subgraph(
     nodes: List[Node],
     model: torch.nn.Module,
     named_modules: Dict[str, torch.nn.Module]
 ) -> Node:
     submodule, new_args = _create_subgraph(nodes)
-    get_new_node_name = get_new_attr_name_with_prefix('submodule_')
-    node_name = get_new_node_name(model)
+    # TODO: cleaner fix for transpose
+    if ("transpose" in nodes[0].name):
+        node_name = f"{nodes[1].name}_module_T"
+    else:
+        node_name = f"{nodes[0].name}_module"
+    print("node_name", node_name)
     setattr(model, node_name, submodule)
     named_modules[node_name] = submodule
     with model.graph.inserting_after(nodes[-1]):
