@@ -432,12 +432,17 @@ if __name__ == "__main__":
         new_output = new_output[0]
 
     elif args.model == "flash_attention":
+        import os
         from flash_attention.generate_flash_attention_gold_data import generate_flash_attention_data
 
         print("== FlashAttention: Preparing Data ==")
         
         # This will generate the model.txt, layers.txt, tensor_files, and tillings.txtpb
-        generate_flash_attention_data(context_length=args.context_length, output_dir_root=args.output_dir, random=True)
+        if os.environ["DATATYPE"] == "BFLOAT16":
+            dtype = "BFLOAT16"
+        else:
+            dtype = "CFLOAT"
+        generate_flash_attention_data(context_length=args.context_length, output_dir_root=args.output_dir, random=True, dtype=dtype)
     
         orig_output, new_output = generate_flash_attention_data()
 
