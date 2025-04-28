@@ -432,43 +432,20 @@ if __name__ == "__main__":
         new_output = new_output[0]
 
     elif args.model == "flash_attention":
-        print_header("FlashAttention: Preparing Quantization")
-        class FlashAttention(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
+        import os
+        from flash_attention.generate_flash_attention_gold_data import generate_flash_attention_data
 
-            def forward(self, query_tile, key_tile, value_tile, max_vector, sum_vector):
-                S = torch.matmul(query_tile, key_tile.transpose(-2, -1))
-                P = torch.nn.functional.softmax(S, dim=-1)
-                return torch.matmul(P, value_tile)
+        print("== FlashAttention: Preparing Data ==")
+        
+        # This will generate the model.txt, layers.txt, tensor_files, and tillings.txtpb
+        if os.environ["DATATYPE"] == "BFLOAT16":
+            dtype = "BFLOAT16"
+        else:
+            dtype = "CFLOAT"
+        generate_flash_attention_data(context_length=args.context_length, output_dir_root=args.output_dir, random=True, dtype=dtype)
+    
+        orig_output, new_output = generate_flash_attention_data()
 
-        query_tensor = torch.randn(1, 64, 64, dtype=torch_dtype)
-        key_tensor = torch.randn(1, 64, 64, dtype=torch_dtype)
-        value_tensor = torch.randn(1, 64, 64, dtype=torch_dtype)
-        max_vector = torch.ones(1, 32, dtype=torch_dtype)
-        sum_vector = torch.ones(1, 32, dtype=torch_dtype)
-
-        query_tile = query_tensor[:, :32, :]
-        key_tile   = key_tensor[:, :32, :]
-        value_tile = value_tensor[:, :32, :]
-        example_args = (query_tile, key_tile, value_tile, max_vector, sum_vector)
-
-        gm = prepare_pt2e(FlashAttention(), quantizer, example_args)
-
-        for i in range(3):
-            gm(*example_args)
-
-        print_header("SelfAttention: Converting to PT2E")
-        convert_pt2e(gm, args.bias)
-
-        print_header("SelfAttention: Transforming")
-        orig_output, new_output = transform(gm, example_args, patterns=vector_stages, model_name="SelfAttention", quantization_scheme=args.weight)
-
-        print_header("SelfAttention: Compiling")
-        compile(gm, example_args, **compile_args)
-
-        orig_output = orig_output[0]
-        new_output = new_output[0]
 
     elif args.model == "mobilebert_encoder":
         if args.model_name_or_path is None:
