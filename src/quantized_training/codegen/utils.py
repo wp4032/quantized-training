@@ -19,9 +19,8 @@ __all__ = [
     "convert_cat_and_stack_as_stack_on_dim0",
     "convert_cat_with_mismatched_shapes_to_stack",
     "convert_expand_to_memory_copy",
-    "eliminate_dtype_conversion",
     "get_conv_bn_layers",
-    "pad_matmul_inputs_for_unroll_alignment",
+    "pad_gemm_inputs_to_hardware_unroll_size",
     "pad_vit_embeddings_output",
     "replace_target_with_vmap",
     "replace_interpolate",
@@ -430,67 +429,18 @@ def rewrite_quantize_mx_for_lastdim(model: torch.fx.GraphModule):
     return model
 
 
-def replace_quantize_mx_with_reduce(model: torch.fx.GraphModule):
+def strip_softmax_dtype(model: torch.fx.GraphModule):
     graph = model.graph
     for node in list(model.graph.nodes):
-        if node.target != torch.ops.quantized_ops.quantize_mx.default:
-            continue
-
-        axis = node.args[1]
-        if axis == -1 or axis == node.value[1].ndim - 1:
-            continue
-
-        axis = axis if axis >= 0 else axis + node.value[1].ndim
-        quant_max = node.args[2]
-        block_size = node.args[3]
-        dtype = node.args[4]
-
-        from ..fake_quantize import get_quantization_map
-
-        @torch.compiler.assume_constant_result
-        def get_code():
-            code = get_quantization_map(dtype)
-            return code[0] if isinstance(code, tuple) else code
-
-        class QuantizeMXDecomposed(torch.nn.Module):
-            def forward(self, input):
-                new_shape = input.shape[:axis] + (-1, block_size) + input.shape[axis + 1:]
-                reshape = input.reshape(new_shape)
-                scale = torch.amax(torch.abs(reshape), axis + 1) * (1.0 / quant_max)
-                code = get_code()
-                quantized = torch.ops.quantized_ops.quantize(
-                    input, scale, dtype, code, block_size
-                )
-                return scale, quantized
-
-        gm = capture_pre_autograd_graph(QuantizeMXDecomposed(), (node.args[0].meta["val"],))
-        replace_node_with_graph_module(model, gm, node)
+        if node.target == torch.ops.aten.softmax.int:
+            node.args = node.args[:2]
 
     graph.lint()
-    graph.eliminate_dead_code()
     model.recompile()
     return model
 
 
-def eliminate_dtype_conversion(model: torch.fx.GraphModule):
-    for node in list(model.graph.nodes):
-        # Eliminate dtype conversion nodes.
-        if node.target == torch.ops.aten.to.dtype:
-            node.replace_all_uses_with(node.args[0])
-            model.graph.erase_node(node)
-            continue
-
-        # Remove the dtype argument from softmax nodes.
-        if node.target == torch.ops.aten.softmax.int and len(node.args) > 2:
-            node.args = node.args[:-1]
-
-    model.graph.lint()
-    model.graph.eliminate_dead_code()
-    model.recompile()
-    return model
-
-
-def pad_matmul_inputs_for_unroll_alignment(
+def pad_gemm_inputs_to_hardware_unroll_size(
     model: torch.fx.GraphModule,
     c_unroll: int = 32,
     k_unroll: int = 32,
@@ -630,7 +580,7 @@ def pad_vit_embeddings_output(
             user.replace_input_with(vit_embed_out, pad_node)
 
     for node in model.graph.nodes:
-        if node.target == torch.ops.aten.view.default:
+        if node.target in [torch.ops.aten.view.default, torch.ops.aten.reshape.default]:
             new_size = [x if x != orig_dim else x + pad for x in node.args[1]]
             node.args = (node.args[0], new_size)
 

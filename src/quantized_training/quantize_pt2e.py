@@ -1,13 +1,13 @@
 import copy
 import itertools
 import operator
+import re
 from collections import OrderedDict
 from dataclasses import asdict, replace
 from typing import Dict, Tuple, Any, Optional, Callable, List
 
 import torch
 from torch import Tensor
-from torch._export import capture_pre_autograd_graph
 from torch.ao.quantization import ObserverOrFakeQuantize
 from torch.ao.quantization.fx.utils import assert_and_get_unique_device
 from torch.ao.quantization.quantizer import (
@@ -237,15 +237,21 @@ def prepare_pt2e(model, quantizer, args, kwargs=None, dynamic_shapes=None):
     from torch.ao.quantization.pt2e import prepare
     from torch.ao.quantization.quantize_pt2e import prepare_pt2e
 
-    # HACK replace the default implementation of _create_obs_or_fq_from_qspec
+    from transformers.utils.import_utils import is_torch_greater_or_equal
+
+    # replace the default implementation of _create_obs_or_fq_from_qspec
     prepare._get_obs_or_fq_map = _get_obs_or_fq_map
 
-    model = capture_pre_autograd_graph(
-        model,
-        args=args,
-        kwargs=kwargs,
-        dynamic_shapes=dynamic_shapes,
-    )
+    if is_torch_greater_or_equal("2.5"):
+        from torch.export import export_for_training
+
+        model = export_for_training(model, args, kwargs, dynamic_shapes=dynamic_shapes).module()
+    else:
+        from torch._export import capture_pre_autograd_graph
+
+        model = capture_pre_autograd_graph(
+            model, args, kwargs, dynamic_shapes=dynamic_shapes
+        )
 
     model = prepare_pt2e(model, quantizer)
     return model
@@ -456,12 +462,23 @@ def _replace_observer_with_quantize_mx_node_decomposed(
     code = get_quantization_map(activation_post_process.dtype, device)
 
     if isinstance(code, tuple):
-        indices = code[0]
+        numbers = re.findall(r'\d+', activation_post_process.dtype)
+        N = int(numbers[0])
+        activation_post_process.dtype = f"int{N}"
+
+        indices, values = code
+
+        activation_post_process.code = indices
+
+        midpoints = (values[:-1] + values[1:]) / 2
         with graph.inserting_before(node):
-            code_node = create_getattr_from_value(model, graph, "code_", code[1])
+            dequant_code = create_getattr_from_value(model, graph, "code_", values)
+            quant_code = create_getattr_from_value(model, graph, "code_", midpoints)
+
+        if len(numbers) > 1:
+            dequant_code.meta["dtype"] = f"int{numbers[1]}"
     else:
-        indices = activation_post_process.code
-        code_node = None
+        dequant_code, quant_code = None, None
 
     if input_node.op == 'get_attr':
         # quantize model parameter and remove the fq module
@@ -479,7 +496,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
             param.data,
             scale,
             activation_post_process.dtype,
-            indices,
+            activation_post_process.code,
             activation_post_process.block_size,
         )
 
@@ -487,7 +504,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
             scale_node = create_getattr_from_value(
                 model, graph, input_node.name + "_scale_", scale)
             quantized_node = create_getattr_from_value(
-                model, graph, input_node.name + "_weight_", weight)
+                model, graph, input_node.name + "_quantized_", weight)
     elif activation_post_process.ch_axis == -2:
         with model.graph.inserting_before(node):
             calculate_qparam_op_inputs = [
@@ -513,7 +530,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                 scale_node.meta["dtype"] = activation_post_process.scale_dtype
 
             get_attr_node = create_getattr_from_value(
-                model, model.graph, "code_", indices,
+                model, model.graph, "code_", activation_post_process.code,
             )
             quantize_op_inputs = [
                 input_node,
@@ -521,6 +538,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                 activation_post_process.dtype,
                 get_attr_node,
                 activation_post_process.block_size,
+                quant_code,
             ]
             quantized_node = model.graph.call_function(
                 torch.ops.quantized_ops.quantize.default,
@@ -533,8 +551,13 @@ def _replace_observer_with_quantize_mx_node_decomposed(
     else:
         with model.graph.inserting_before(node):
             get_attr_node = create_getattr_from_value(
-                model, model.graph, "code_", indices,
+                model, model.graph, "code_", activation_post_process.code,
             )
+
+            scale_code_node = None
+            if activation_post_process.scale_code is not None:
+                scale_code_node = create_getattr_from_value(
+                    model, model.graph, "code_", activation_post_process.scale_code)
 
             quantize_mx_inputs = [
                 input_node,
@@ -544,12 +567,9 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                 activation_post_process.dtype,
                 get_attr_node,
                 activation_post_process.force_scale_power_of_two,
+                scale_code_node,
+                quant_code,
             ]
-
-            if activation_post_process.scale_code is not None:
-                scale_code_node = create_getattr_from_value(
-                    model, model.graph, "code_", activation_post_process.scale_code)
-                quantize_mx_inputs.append(scale_code_node)
 
             quantize_mx_node = model.graph.call_function(
                 torch.ops.quantized_ops.quantize_mx.default,
@@ -592,16 +612,17 @@ def _replace_observer_with_quantize_mx_node_decomposed(
 
     for user in orig_fq_users:
         # Keep the original nodes for other users
-        kwarg1, kwarg2 = code_node, scale_node
+        kwarg1, kwarg2 = dequant_code, scale_node
 
         # Skip device alignment node
         if user.target == torch.Tensor.to:
             user_device = user.args[1]
 
             with graph.inserting_before(user):
-                kwarg1 = graph.call_function(
-                    torch.Tensor.to, (code_node, user_device)
-                )
+                if kwarg1 is not None:
+                    kwarg1 = graph.call_function(
+                        torch.Tensor.to, (dequant_code, user_device)
+                    )
 
                 kwarg2 = graph.call_function(
                     torch.Tensor.to, (scale_node, user_device)
@@ -644,24 +665,22 @@ def _replace_observer_with_quantize_mx_node_decomposed(
 
 
 def _eliminate_dequantize_with_no_effect(model: GraphModule):
-    partitions = get_source_partitions(
-        model.graph, [torch.ops.quantized_ops.dequantize.default]
-    )
-    partitions = list(itertools.chain.from_iterable(partitions.values()))
-    for partition in partitions:
-        dequantized_node = partition.output_nodes[0]
+    for node in model.graph.nodes:
+        if node.target != torch.ops.quantized_ops.dequantize.default:
+            continue
 
-        scale_node = dequantized_node.args[1]
+        scale_node = node.args[1]
         scale = model.get_buffer(scale_node.target)
         if torch.any(scale != 1):
             continue
 
-        dtype = dequantized_node.args[2]
-        if dtype is not None:
+        # During integer quantization, the dequantize node also perform a
+        # quantization to the output dtype
+        if node.args[2] is not None:
             continue
 
-        dequantized_node.replace_all_uses_with(dequantized_node.args[0])
-        model.graph.erase_node(dequantized_node)
+        node.replace_all_uses_with(node.args[0])
+        model.graph.erase_node(node)
 
     model.graph.lint()
     model.graph.eliminate_dead_code()
@@ -740,16 +759,14 @@ def fuse_quantize_dequantize_with_previous_op(model: GraphModule):
     # First, move the dequantize nodes before the stack and view nodes that
     # are inserted during MHA splitting. Then try to move quantize nodes forward
     # to immediately after their previous ops (nodes that are not NOP).
-    partitions = get_source_partitions(model.graph, [
-        torch.ops.quantized_ops.dequantize.default,
-        torch.ops.quantized_ops.quantize.default
-    ])
-    partitions = list(itertools.chain.from_iterable(partitions.values()))
+    for node in list(model.graph.nodes):
+        if node.target not in [
+            torch.ops.quantized_ops.dequantize.default,
+            torch.ops.quantized_ops.quantize.default
+        ]:
+            continue
 
-    node_order = {n: i for i, n in enumerate(graph.nodes)}
-    nodes_to_process = sorted(partitions, key=lambda p: node_order[p.output_nodes[0]])
-    for partition in nodes_to_process:
-        output_node = partition.output_nodes[0]
+        output_node = node
         nodes_on_path = find_prev_op_and_move_node(output_node)
         if nodes_on_path is None:
             continue
