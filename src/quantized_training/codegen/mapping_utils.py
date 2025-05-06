@@ -199,7 +199,7 @@ def map_node(node: torch.fx.Node, output_dir=None) -> OpOverload:
 
     # Convert keyword arguments
     for key, value in kwargs.items():
-        if "code" not in key and value is not None:
+        if key not in ["code", "scale_code"] and value is not None:
             op_overload.kwargs[key].CopyFrom(convert_arg(value))
 
     return op_overload
@@ -359,6 +359,7 @@ def _is_nop(node: Node) -> bool:
         torch.ops.aten.reshape.default,
         torch.ops.aten.squeeze.dim,
         torch.ops.aten.squeeze.dims,
+        torch.ops.aten.to.dtype,
         torch.ops.aten.unsqueeze.default,
         torch.ops.aten.view.default,
     ]
