@@ -61,14 +61,6 @@ task_to_keys = {
     "wnli": ("sentence1", "sentence2"),
 }
 
-
-TORCHVISION_MODELS = {
-    "resnet18": models.resnet18,
-    "resnet50": models.resnet50,
-    "mobilenet": models.mobilenet_v2,
-}
-
-
 vector_stages = [
     [
         ["gemm"],
@@ -176,12 +168,20 @@ if __name__ == "__main__":
         print(text)
         print("=" * len(text) + "\n")
 
-    if args.model in TORCHVISION_MODELS:
-        model = TORCHVISION_MODELS[args.model](pretrained=True).eval()
+    if args.model in models.__dict__:
+        if args.model_name_or_path is None:
+            args.model_name_or_path = "DEFAULT"
 
-        if args.model_name_or_path:
-            checkpoint = torch.load(args.model_name_or_path, map_location="cpu")
-            model.load_state_dict(checkpoint['state_dict'], strict=False)
+        try:
+            model = models.__dict__[args.model](weights=args.model_name_or_path)
+        except Exception as e:
+            model = models.__dict__[args.model]()
+
+            if args.model_name_or_path:
+                checkpoint = torch.load(args.model_name_or_path, map_location="cpu")
+                model.load_state_dict(checkpoint['state_dict'], strict=False)
+        
+        model.eval()
 
         if args.bf16:
             model.bfloat16()
@@ -189,13 +189,6 @@ if __name__ == "__main__":
         modules_to_fuse = get_conv_bn_layers(model)
         if len(modules_to_fuse) > 0:
             model = torch.ao.quantization.fuse_modules(model, modules_to_fuse, inplace=True)
-
-        # Accelerator only supports 2x2 maxpool
-        for module in model.modules():
-            if isinstance(module, torch.nn.MaxPool2d):
-                module.kernel_size = 2
-                module.stride = 2
-                module.padding = 0
 
         quantizer.set_module_name("fc", None)
 
