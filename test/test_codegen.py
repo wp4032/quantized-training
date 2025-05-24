@@ -462,6 +462,8 @@ if __name__ == "__main__":
         # This will generate the model.txt, layers.txt, tensor_files, and tillings.txtpb
         if os.environ["DATATYPE"] == "BFLOAT16":
             dtype = "BFLOAT16"
+        if os.environ["DATATYPE"] == "MXINT8":
+            dtype = "MXINT8"
         else:
             dtype = "CFLOAT"
         generate_flash_attention_data(context_length=args.context_length, output_dir_root=args.output_dir, random=True, dtype=dtype)
