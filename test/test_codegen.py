@@ -802,6 +802,64 @@ if __name__ == "__main__":
 
         orig_output, new_output = transform(gm, example_args, patterns=vector_stages)
         compile(gm, example_args, **compile_args)
+    elif args.model == "polyapprox":
+        class PolyApproxModel(torch.nn.Module):
+            def __init__(self):
+                super(PolyApproxModel, self).__init__()
+                self.gelu = torch.nn.GELU()
+                self.silu = torch.nn.SiLU()
+                self.elu = torch.nn.ELU()
+                self.log_sigmoid = torch.nn.LogSigmoid()
+                self.tanh = torch.nn.Tanh()
+                self.tanh_1 = torch.nn.Tanhshrink()
+                self.softplus = torch.nn.Softplus()
+                self.mish = torch.nn.Mish()
+                self.sigmoid = torch.nn.Sigmoid()
+                self.selu = torch.nn.SELU()
+                self.celu = torch.nn.CELU()
+                self.hardsigmoid = torch.nn.Hardsigmoid()
+                self.hardswish = torch.nn.Hardswish()
+
+            def forward(self, x):
+                # Compute all activation functions
+                outputs = [
+                    self.gelu(x),
+                    self.silu(x),
+                    self.elu(x),
+                    self.log_sigmoid(x),
+                    self.tanh(x),
+                    self.tanh_1(x),
+                    self.softplus(x),
+                    self.mish(x),
+                    self.sigmoid(x),
+                    self.selu(x),
+                    self.celu(x),
+                    self.hardsigmoid(x),
+                    self.hardswish(x)
+                ]
+                # Concatenate all outputs along a new dimension
+                return torch.stack(outputs, dim=0)
+
+        model = PolyApproxModel()
+
+        if args.bf16:
+            model.bfloat16()
+        torch_dtype = torch.bfloat16 if args.bf16 else torch.float32
+
+        # Create input tensor with reasonable range
+        example_args = (torch.randn(1, 32, 16, 16, dtype=torch_dtype).clamp_(-2, 2),)
+
+        gm = prepare_pt2e(model, quantizer, example_args) 
+
+        convert_pt2e(gm)
+
+        orig_output, new_output = transform(
+            gm,
+            example_args,
+            patterns=vector_stages
+        )
+
+        compile(gm, example_args, **compile_args)
     else:
         raise ValueError(f"Model {args.model} not supported")
 
