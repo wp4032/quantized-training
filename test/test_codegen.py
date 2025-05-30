@@ -466,10 +466,22 @@ if __name__ == "__main__":
             dtype = "MXINT8"
         else:
             dtype = "CFLOAT"
-        generate_flash_attention_data(context_length=args.context_length, output_dir_root=args.output_dir, random=True, dtype=dtype)
+        orig_output, new_output = generate_flash_attention_data(context_length=args.context_length, output_dir_root=args.output_dir, random=True, dtype=dtype)
     
-        orig_output, new_output = generate_flash_attention_data()
+    elif args.model == "qkt_flash_attention":
+        import os
+        from flash_attention.generate_flash_attention_gold_data_qkt import generate_flash_attention_data_qkt
 
+        print("== FlashAttention QKT: Preparing Data ==")
+        
+        # This will generate the model.txt, layers.txt, tensor_files, and tillings.txtpb
+        if os.environ["DATATYPE"] == "BFLOAT16":
+            dtype = "BFLOAT16"
+        if os.environ["DATATYPE"] == "MXINT8":
+            dtype = "MXINT8"
+        else:
+            dtype = "CFLOAT"
+        orig_output, new_output = generate_flash_attention_data_qkt(context_length=args.context_length, output_dir_root=args.output_dir, random=False, dtype=dtype)
 
     elif args.model == "mobilebert_encoder":
         if args.model_name_or_path is None:
