@@ -481,7 +481,10 @@ if __name__ == "__main__":
             dtype = "MXINT8"
         else:
             dtype = "CFLOAT"
-        orig_output, new_output = generate_flash_attention_data_qkt(context_length=args.context_length, output_dir_root=args.output_dir, random=False, dtype=dtype)
+
+        tile_size = int(os.environ["OC_DIMENSION"])
+        
+        orig_output, new_output = generate_flash_attention_data_qkt(context_length=args.context_length, output_dir_root=args.output_dir, random=False, dtype=dtype, tile_size=tile_size)
 
     elif args.model == "mobilebert_encoder":
         if args.model_name_or_path is None:

@@ -69,7 +69,7 @@ def write_flash_attention_model_qkt(
         shape, dt, addr = meta[node]
         if node.endswith("_step_0") and node.split("_step_")[0] in ("q_tile", "k_tile"):
             if len(shape) == 3 and shape[0] == 1:
-                shape_to_emit = shape[1:]          # (32, 64)
+                shape_to_emit = shape[1:]
             else:
                 shape_to_emit = shape
         else:
@@ -149,7 +149,7 @@ def write_flash_attention_model_qkt(
 
     # TODO: fix the hardcoding of these
     QKT_SCALAR_KWARG_MAP = {
-        "key_dim": 8.0,
+        "key_dim": 0.125,
         "context_length": context_length,
         "num_heads": 12,
         "quantize_mx": 1,
@@ -219,9 +219,9 @@ def write_flash_attention_model_qkt(
         emit_output("p_tensor_scale", saddr_shape, "fp8_e8m0", addr)
         meta["p_tensor_scale"] = (saddr_shape, "fp8_e8m0", addr)
     
-    add_out("max", ((num_steps - 1) * 32,), dt_vec, sz_vec)
-    add_out("sum", ((num_steps - 1) * 32,), dt_vec, sz_vec)
-    add_out("rescale", ((num_steps - 1) * 32,), dt_vec, sz_vec)
+    add_out("max", ((num_steps - 1) * block_size,), dt_vec, sz_vec)
+    add_out("sum", ((num_steps - 1) * block_size,), dt_vec, sz_vec)
+    add_out("rescale", ((num_steps - 1) * block_size,), dt_vec, sz_vec)
 
     lines.append("  }")        # close outputs
     lines.append("}")          # close ops
@@ -275,7 +275,7 @@ def write_flash_attention_tilings_qkt(out_txt: str):
 def bin_name(tensor_name: str, dir: str) -> str:
     return os.path.join(dir, f"{tensor_name}.bin")
 
-def save(t: torch.Tensor, name: str, dir: str, dtype: str):
+def save(t: torch.Tensor, name: str, dir: str, dtype: str, tile_size: int):
     if dtype == "CFLOAT" or dtype == "BFLOAT16":
         save_tensor(t, bin_name(name, dir))
     elif dtype == "MXINT8": 
@@ -283,9 +283,9 @@ def save(t: torch.Tensor, name: str, dir: str, dtype: str):
         quantized_tensors = ["q_tensor", "k_tensor", "v_tensor", "p_tensor"]   
         if name in quantized_tensors:
             if name == "k_tensor":
-                q, scale = simple_mx_quantize(t, axes=[-2], block_size=32)
+                q, scale = simple_mx_quantize(t, axes=[-2], block_size=tile_size)
             else:
-                q, scale = simple_mx_quantize(t, axes=[-1], block_size=32)
+                q, scale = simple_mx_quantize(t, axes=[-1], block_size=tile_size)
             save_tensor(q, bin_name(name, dir)) 
             save_tensor(scale, bin_name(name + "_scale", dir)) 
         else:
@@ -628,7 +628,7 @@ def run_flash_attention_tiled_qkt(
     print(f"all(t is not None for t in qkt_return): {iter}")
     if qkt_return and all(t is not None for t in qkt_return):
         # Calculate dimensions
-        tile_dim = qkt_return[0].size(0)  # Should be 32 for 32x32 tiles
+        tile_dim = qkt_return[0].size(0) 
         num_tiles_per_row = int(math.sqrt(len(qkt_return)))
         context_length = num_tiles_per_row * tile_dim
         
@@ -656,7 +656,7 @@ def run_flash_attention_tiled_qkt(
     # For a context length of n, we'll have n/tile_size rows and columns of tiles
     if p_return and all(t is not None for t in p_return):
         # Calculate dimensions
-        tile_dim = p_return[0].size(0)  # Should be 32 for 32x32 tiles
+        tile_dim = p_return[0].size(0)
         num_tiles_per_row = int(math.sqrt(len(p_return)))
         context_length = num_tiles_per_row * tile_dim
         
@@ -710,16 +710,16 @@ def run_flash_attention_tiled_qkt(
     os.makedirs(dir, exist_ok=True)
 
     # Save all the input tensors
-    save(Q,               "q_tensor", dir, dtype)
-    save(K,               "k_tensor", dir, dtype)
-    save(V,               "v_tensor", dir, dtype)
+    save(Q,               "q_tensor", dir, dtype, tile_size)
+    save(K,               "k_tensor", dir, dtype, tile_size)
+    save(V,               "v_tensor", dir, dtype, tile_size)
     # Save all the results tensors
-    save(qkt_return,      "qkt_tensor", dir, dtype)
-    save(p_return,        "p_tensor", dir, dtype)
-    save(final_O,         "self_attention_tensor", dir, dtype)
-    save(max_return,      "max", dir, dtype)
-    save(sum_return,      "sum", dir, dtype)
-    save(rescale_return,  "rescale", dir, dtype)
+    save(qkt_return,      "qkt_tensor", dir, dtype, tile_size)
+    save(p_return,        "p_tensor", dir, dtype, tile_size)
+    save(final_O,         "self_attention_tensor", dir, dtype, tile_size)
+    save(max_return,      "max", dir, dtype, tile_size)
+    save(sum_return,      "sum", dir, dtype, tile_size)
+    save(rescale_return,  "rescale", dir, dtype, tile_size)
     
 
     # Save all the tensors to the tensor_files directory
@@ -813,13 +813,16 @@ def compare_results(final_O, final_O_vanilla):
     is_close = torch.allclose(final_O, final_O_vanilla, rtol=rtol, atol=atol)
     print(f"\nResults are {'close' if is_close else 'NOT close'} within tolerance (rtol={rtol}, atol={atol})")
 
-def generate_flash_attention_data_qkt(context_length=64, output_dir_root="test/compiler/networks/flash_attention/CFLOAT/", random=True, dtype="CFLOAT"):
+def generate_flash_attention_data_qkt(context_length=64, 
+                                      output_dir_root="test/compiler/networks/flash_attention/CFLOAT/", 
+                                      random=True, 
+                                      dtype="CFLOAT",
+                                      tile_size=32):
     print("Generating flash attention gold data.")
     print("Context length:", context_length)
 
     torch.set_default_dtype(torch.float32)
     
-    tile_size = 32
     matrix_row = context_length
     matrix_col = 64
     random = random
